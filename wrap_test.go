@@ -1,7 +1,3 @@
-/*
- * © Copyright 2022 Quick Heal Technologies Limited. All rights reserved.
- */
-
 package regexrating
 
 import (
