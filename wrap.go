@@ -1,20 +1,3 @@
-/*
- * © Copyright 2022 Quick Heal Technologies Limited. All rights reserved.
- */
-
-// Package regexanalyzer inspects compiled regex string patterns and decides
-// whether \b (word-boundary) anchors can safely be prepended and/or appended.
-//
-// Safety definition
-//
-//   - \b is safe at the START when the pattern's first token is guaranteed to
-//     match a word character (\w / \d / non-negated char class that contains
-//     word chars / a literal word rune). Patterns that begin with anchors,
-//     groups, negated classes, non-word escapes, or dots are NOT safe.
-//
-//   - \b is safe at the END when the pattern's last token (ignoring trailing
-//     quantifiers) is guaranteed to end on a word character. The same rules
-//     apply symmetrically.
 package regexrating
 
 import (
