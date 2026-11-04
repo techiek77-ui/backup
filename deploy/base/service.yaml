@@ -1,0 +1,17 @@
+# ClusterIP on purpose: the API has no authentication, so it must not be
+# reachable from outside the cluster. Use `kubectl port-forward` for demos,
+# or front it with an authenticating ingress / API gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: podspawner
+  labels:
+    app.kubernetes.io/name: podspawner
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: podspawner
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

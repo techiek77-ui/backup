@@ -1,0 +1,21 @@
+# Local demo on kind: image is side-loaded with `kind load docker-image`,
+# so never try to pull it from a registry.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: podspawner
+    newName: podspawner
+    newTag: dev
+
+patches:
+  - target:
+      kind: Deployment
+      name: podspawner
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never

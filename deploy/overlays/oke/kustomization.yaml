@@ -1,0 +1,21 @@
+# Oracle Container Engine for Kubernetes (OKE), managed node pools.
+#
+# 1. Push the image to OCIR and set newName/newTag below, e.g.
+#      newName: fra.ocir.io/axabcdefghij/podspawner
+#      newTag:  0.1.0
+#    (or run `make oke-deploy IMAGE=...` which substitutes it for you).
+# 2. Create the OCIR pull secret in the namespace (see README).
+# 3. Label the worker node pool (see README) so WORKER_NODE_SELECTOR matches.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: podspawner
+    newName: REGION_KEY.ocir.io/TENANCY_NAMESPACE/podspawner
+    newTag: 0.1.0
+
+patches:
+  - path: deployment-patch.yaml

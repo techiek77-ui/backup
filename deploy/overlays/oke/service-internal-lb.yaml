@@ -1,0 +1,30 @@
+# OPTIONAL — not applied by the overlay. Exposes the API on an *internal*
+# OCI load balancer (private IP in the LB subnet) so other workloads in the
+# VCN can call it without port-forwarding.
+#
+# The API is unauthenticated and lets callers run arbitrary images, so do
+# NOT drop the `oci-load-balancer-internal` annotation to make it public.
+#
+#   kubectl apply -f deploy/overlays/oke/service-internal-lb.yaml
+#   kubectl -n podspawner get svc podspawner-internal   # wait for EXTERNAL-IP
+apiVersion: v1
+kind: Service
+metadata:
+  name: podspawner-internal
+  namespace: podspawner
+  annotations:
+    oci.oraclecloud.com/load-balancer-type: "lb"
+    service.beta.kubernetes.io/oci-load-balancer-internal: "true"
+    service.beta.kubernetes.io/oci-load-balancer-shape: "flexible"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "10"
+    # Optional: pin the LB to a specific subnet OCID.
+    # service.beta.kubernetes.io/oci-load-balancer-subnet1: "ocid1.subnet.oc1..."
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: podspawner
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

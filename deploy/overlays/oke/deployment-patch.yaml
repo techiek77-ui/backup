@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podspawner
+spec:
+  template:
+    spec:
+      # Pull secret for the controller image in OCIR. Not needed if the OCIR
+      # repository is public.
+      imagePullSecrets:
+        - name: ocirsecret
+      containers:
+        - name: controller
+          imagePullPolicy: IfNotPresent
+          env:
+            # Which nodes run worker pods. Must be a node *label* (nodeSelector
+            # cannot match annotations such as oci.oraclecloud.com/node-pool-id).
+            # Recommended: a custom label applied to the worker node pool via
+            # its "Kubernetes labels" / --initial-node-labels, so every node the
+            # pool creates carries it (README: "Label the worker node pool").
+            # Any existing label works too — list them with:
+            #   kubectl get nodes --show-labels
+            - name: WORKER_NODE_SELECTOR
+              value: "workload=worker"
+
+            # Uncomment if worker images live in a private OCIR repo.
+            # - name: WORKER_IMAGE_PULL_SECRET
+            #   value: ocirsecret
+
+            # Uncomment if the worker node pool is tainted (dedicated pool).
+            # - name: WORKER_TOLERATIONS
+            #   value: '[{"key":"dedicated","operator":"Equal","value":"worker","effect":"NoSchedule"}]'

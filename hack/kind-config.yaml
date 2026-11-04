@@ -1,0 +1,9 @@
+# Three nodes so the demo can prove the node selector works: only
+# `<cluster>-worker` gets the workload=worker label; `<cluster>-worker2` is
+# a decoy that must never receive worker pods.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
