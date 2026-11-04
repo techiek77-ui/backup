@@ -105,12 +105,15 @@ oci ce node-pool update --node-pool-id <node-pool-OCID> \
   --initial-node-labels '[{"key":"workload","value":"worker"}]'
 ```
 
-The same setting is the node pool's **Kubernetes labels** in the Console.
-Two things to know:
+This is the node pool's *Kubernetes labels* setting (`initialNodeLabels` in
+the API: a JSON list of `key`/`value` objects; `oci ce node-pool update
+--generate-param-json-input initial-node-labels` prints the exact template for
+your CLI version). Three things to know:
 
-* `--initial-node-labels` **replaces** the pool's label list and applies to
-  **new nodes only**. Label the nodes that already exist (or cycle them with
-  `--node-pool-cycling-details`):
+* Treat `--initial-node-labels` as **replacing** the pool's label list, so
+  include any labels the pool already has.
+* It applies to **new nodes only**. Label the nodes that already exist (or
+  cycle them with `--node-pool-cycling-details`):
 
   ```bash
   kubectl label nodes -l <some-label-identifying-the-pool> workload=worker
@@ -212,10 +215,13 @@ one of the `workload=worker` nodes; afterwards it is gone.
   pulling public images (the default `busybox:1.36` worker image comes from
   Docker Hub) from a private worker subnet needs a **NAT gateway** on its route
   table. If outbound internet is not allowed, mirror worker images into OCIR.
-* **Scaling** — the labelled pool can be sized to zero worker nodes when idle
-  only if something adds nodes on demand (e.g. the OKE Cluster Autoscaler on
-  that pool); otherwise keep at least one node in it, or jobs fail after
-  `WORKER_SCHEDULE_TIMEOUT` with the scheduler's "0/N nodes are available" message.
+* **Scaling** — keep at least one node in the labelled pool, or jobs fail after
+  `WORKER_SCHEDULE_TIMEOUT` with the scheduler's "0/N nodes are available"
+  message. To pay for worker nodes only while work runs, let the OKE Cluster
+  Autoscaler manage that pool with a zero minimum
+  (`--nodes=0:<max>:<worker-node-pool-OCID>`) and raise
+  `WORKER_SCHEDULE_TIMEOUT` to cover node provisioning time. Run the
+  autoscaler and this controller on a pool that never scales to zero.
 
 ## Configuration (environment variables on the controller)
 
@@ -246,7 +252,8 @@ one of the `workload=worker` nodes; afterwards it is gone.
 3. It watches that single pod. Scheduling failures and image-pull errors are
    copied into the job's `message`; a pod that is never scheduled is given up
    after `WORKER_SCHEDULE_TIMEOUT` (`activeDeadlineSeconds` only starts once a
-   kubelet has accepted the pod, so it would otherwise hang forever).
+   kubelet has accepted the pod, so it would otherwise hang forever). Watches
+   the API server closes are resumed from a fresh GET, so long jobs are safe.
 4. On `Succeeded`/`Failed` it reads the container logs and exit code, records
    them, and **deletes the pod** (always — also on timeouts, errors and
    controller shutdown; the only exception is `KEEP_FAILED_PODS=true`).
@@ -276,3 +283,7 @@ pods and `get` pod logs in its own namespace only.
 * OCI load balancer service annotations — <https://github.com/oracle/oci-cloud-controller-manager/blob/master/docs/load-balancer-annotations.md>
 * Auto-tainting OKE nodes at start-up (cloud-init / `--register-with-taints`) — <https://blogs.oracle.com/cloud-infrastructure/post/auto-tainting-oke-nodes-startup>
 * OKE worker nodes and OCIR via the service gateway — <https://docs.oracle.com/en/learn/oci-oke-cluster-worker-nodes>
+* OCI CLI `oci ce node-pool create` (`--initial-node-labels` is a JSON list of `KeyValue`) — <https://docs.oracle.com/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/ce/node-pool/create.html>
+* Using the Kubernetes Cluster Autoscaler on OKE — <https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengusingclusterautoscaler.htm>
+* Optimizing OKE costs with KEDA and Cluster Autoscaling (`--nodes=0:N:<ocid>`) — <https://blogs.oracle.com/cloud-infrastructure/optimizing-oke-costs-with-keda-and-cluster-autoscaling>
+* OCI Load Balancer flexible shape bounds (10–8000 Mbps) — <https://docs.oracle.com/en-us/iaas/tools/python/latest/api/load_balancer/models/oci.load_balancer.models.ShapeDetails.html>

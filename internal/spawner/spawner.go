@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -172,7 +173,7 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 	waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
 
-	final, err := s.waitForCompletion(waitCtx, jobID, created.Name, created.ResourceVersion)
+	final, err := s.waitForCompletion(waitCtx, jobID, created.Name)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			err = fmt.Errorf("timed out after %s waiting for pod to finish", waitTimeout)
@@ -208,76 +209,100 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 	}
 }
 
-// waitForCompletion watches a single pod until it reaches a terminal phase.
-func (s *Spawner) waitForCompletion(ctx context.Context, jobID, name, rv string) (*corev1.Pod, error) {
+// waitForCompletion follows a single pod until it reaches a terminal phase.
+//
+// The API server closes long-lived watches periodically and answers watches
+// that resume from a stale resource version with 410 Gone, so a closed watch
+// is never treated as a job failure: the pod is re-read with a GET (which
+// also catches pods that finished before the watch was established) and a
+// new watch is started from the GET's resource version, leaving no gap.
+func (s *Spawner) waitForCompletion(ctx context.Context, jobID, name string) (*corev1.Pod, error) {
 	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
-
-	// Check current state first in case the pod already finished before the
-	// watch is established (very short commands).
-	scheduled := false
-	if cur, err := pods.Get(ctx, name, metav1.GetOptions{}); err == nil {
-		if isTerminal(cur) {
-			return cur, nil
-		}
-		scheduled = cur.Spec.NodeName != ""
-		s.observe(jobID, cur)
-	}
-
-	w, err := pods.Watch(ctx, metav1.ListOptions{
-		FieldSelector:   fields.OneTermEqualSelector("metadata.name", name).String(),
-		ResourceVersion: rv,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("watch pod: %w", err)
-	}
-	defer w.Stop()
 
 	schedTimer := time.NewTimer(s.cfg.ScheduleTimeout)
 	defer schedTimer.Stop()
+	scheduled := false
 
-	for {
+	for attempt := 0; ; attempt++ {
+		cur, err := pods.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get pod: %w", err)
+		}
+		if isTerminal(cur) {
+			return cur, nil
+		}
+		if cur.Spec.NodeName != "" {
+			scheduled = true
+		}
+		s.observe(jobID, cur)
+
+		w, err := pods.Watch(ctx, metav1.ListOptions{
+			FieldSelector:   fields.OneTermEqualSelector("metadata.name", name).String(),
+			ResourceVersion: cur.ResourceVersion,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("watch pod: %w", err)
+		}
+		final, retry, err := s.consumeWatch(ctx, w, jobID, name, &scheduled, schedTimer)
+		w.Stop()
+		if err != nil || final != nil {
+			return final, err
+		}
+		if !retry {
+			return nil, errors.New("watch ended unexpectedly")
+		}
+		s.log.Debug("watch closed, re-establishing", "job", jobID, "pod", name, "attempt", attempt+1)
+		// Brief pause so a misbehaving proxy cannot turn this into a hot loop.
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// consumeWatch drains events until the pod is terminal (returned), the watch
+// is closed or expired (retry=true), or something fatal happens (err).
+func (s *Spawner) consumeWatch(ctx context.Context, w watch.Interface, jobID, name string, scheduled *bool, schedTimer *time.Timer) (*corev1.Pod, bool, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
 
 		case <-schedTimer.C:
-			if scheduled {
+			if *scheduled {
 				continue
 			}
 			msg := fmt.Sprintf("pod was not scheduled within %s", s.cfg.ScheduleTimeout)
 			if j, ok := s.store.Get(jobID); ok && j.Message != "" {
 				msg += ": " + j.Message
 			}
-			return nil, errors.New(msg)
+			return nil, false, errors.New(msg)
 
 		case ev, ok := <-w.ResultChan():
 			if !ok {
-				// Watch closed by the API server; re-check state once.
-				cur, err := pods.Get(ctx, name, metav1.GetOptions{})
-				if err != nil {
-					return nil, fmt.Errorf("watch closed and get failed: %w", err)
-				}
-				if isTerminal(cur) {
-					return cur, nil
-				}
-				return nil, fmt.Errorf("watch closed before pod finished (phase %s)", cur.Status.Phase)
+				return nil, true, nil
 			}
 			switch ev.Type {
 			case watch.Deleted:
-				return nil, errors.New("pod was deleted externally")
+				return nil, false, errors.New("pod was deleted externally")
 			case watch.Error:
-				return nil, fmt.Errorf("watch error: %v", ev.Object)
+				err := apierrors.FromObject(ev.Object)
+				if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+					return nil, true, nil
+				}
+				return nil, false, fmt.Errorf("watch error: %w", err)
 			}
 			p, ok := ev.Object.(*corev1.Pod)
 			if !ok || p.Name != name {
 				continue
 			}
 			if p.Spec.NodeName != "" {
-				scheduled = true
+				*scheduled = true
 			}
 			s.observe(jobID, p)
 			if isTerminal(p) {
-				return p, nil
+				return p, false, nil
 			}
 		}
 	}

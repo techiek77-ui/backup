@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,10 @@ type harness struct {
 	store      *store.Store
 	sp         *Spawner
 	watchReady chan struct{}
+
+	mu        sync.Mutex
+	lastWatch watch.Interface
+	watches   int
 }
 
 func newHarness(t *testing.T, cfg Config) *harness {
@@ -42,21 +47,37 @@ func newHarness(t *testing.T, cfg Config) *harness {
 
 	// Signal when the spawner has established its watch, so tests can mutate
 	// the pod only after events will be delivered (the fake ignores RV).
-	watchReady := make(chan struct{}, 8)
+	h := &harness{client: client, watchReady: make(chan struct{}, 8)}
 	gvr := corev1.SchemeGroupVersion.WithResource("pods")
 	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
 		w, err := client.Tracker().Watch(gvr, action.GetNamespace())
 		if err != nil {
 			return false, nil, err
 		}
-		watchReady <- struct{}{}
+		h.mu.Lock()
+		h.lastWatch, h.watches = w, h.watches+1
+		h.mu.Unlock()
+		h.watchReady <- struct{}{}
 		return true, w, nil
 	})
 
 	cfg.Namespace = testNS
-	st := store.New()
-	sp := New(client, cfg, st, slog.New(slog.NewTextHandler(testWriter{t}, nil)))
-	return &harness{client: client, store: st, sp: sp, watchReady: watchReady}
+	h.store = store.New()
+	h.sp = New(client, cfg, h.store, slog.New(slog.NewTextHandler(testWriter{t}, nil)))
+	return h
+}
+
+// closeWatch simulates the API server dropping the current watch connection.
+func (h *harness) closeWatch() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastWatch.Stop()
+}
+
+func (h *harness) watchCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.watches
 }
 
 type testWriter struct{ t *testing.T }
@@ -327,4 +348,58 @@ func TestCleanupOrphans(t *testing.T) {
 	if _, err := h.client.CoreV1().Pods(testNS).Get(ctx, "unrelated", metav1.GetOptions{}); err != nil {
 		t.Fatalf("unrelated pod must survive: %v", err)
 	}
+}
+
+func TestRunSurvivesWatchClose(t *testing.T) {
+	h := newHarness(t, Config{})
+	done := h.submit(t, "job7", store.WorkSpec{Image: "busybox"})
+	h.awaitWatch(t)
+
+	// API server drops the watch while the pod is still running: the
+	// spawner must re-GET and re-watch instead of failing the job.
+	h.closeWatch()
+	h.awaitWatch(t)
+	if n := h.watchCount(); n != 2 {
+		t.Fatalf("expected a second watch to be established, got %d", n)
+	}
+	if j, _ := h.store.Get("job7"); j.Status != store.StatusRunning {
+		t.Fatalf("job must still be Running after a watch close, got %s (%s)", j.Status, j.Error)
+	}
+
+	pod := h.workerPod(t, "job7")
+	h.finishPod(t, pod, corev1.PodSucceeded, 0)
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job7")
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status = %s err=%q", j.Status, j.Error)
+	}
+	h.assertPodGone(t, pod.Name)
+}
+
+func TestRunFinishedBeforeWatch(t *testing.T) {
+	// A pod that is already terminal when the spawner first looks at it
+	// (very short command) must be handled from the GET alone.
+	h := newHarness(t, Config{})
+	h.client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		pod.Spec.NodeName = "worker-1"
+		pod.Status.Phase = corev1.PodSucceeded
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  ContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+		}}
+		return false, nil, nil
+	})
+	done := h.submit(t, "job8", store.WorkSpec{Image: "busybox", Command: []string{"true"}})
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job8")
+	if j.Status != store.StatusSucceeded || j.NodeName != "worker-1" {
+		t.Fatalf("got %+v", j)
+	}
+	if h.watchCount() != 0 {
+		t.Fatalf("no watch should have been needed, got %d", h.watchCount())
+	}
+	h.assertPodGone(t, j.PodName)
 }
