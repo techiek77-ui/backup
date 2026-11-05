@@ -2,9 +2,11 @@ package spawner
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,6 +64,15 @@ func newHarness(t *testing.T, cfg Config) *harness {
 	})
 
 	cfg.Namespace = testNS
+	if cfg.retryBase == 0 {
+		cfg.retryBase = 10 * time.Millisecond
+	}
+	if cfg.deleteWait == 0 {
+		cfg.deleteWait = 200 * time.Millisecond
+	}
+	if cfg.pollInterval == 0 {
+		cfg.pollInterval = 10 * time.Millisecond
+	}
 	h.store = store.New()
 	h.sp = New(client, cfg, h.store, slog.New(slog.NewTextHandler(testWriter{t}, nil)))
 	return h
@@ -326,27 +337,52 @@ func TestRunContextCancelledDeletesPod(t *testing.T) {
 	h.assertPodGone(t, pod.Name)
 }
 
-func TestCleanupOrphans(t *testing.T) {
+func TestSweepDeletesOnlyOrphans(t *testing.T) {
 	h := newHarness(t, Config{})
 	ctx := context.Background()
 	mk := func(name string, labels map[string]string) {
+		t.Helper()
 		_, err := h.client.CoreV1().Pods(testNS).Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	mk("work-old-1", map[string]string{LabelApp: AppName, LabelJobID: "old1"})
-	mk("work-old-2", map[string]string{LabelApp: AppName, LabelJobID: "old2"})
+	h.store.Put(&store.Job{ID: "active", Status: store.StatusRunning, CreatedAt: time.Now()})
+	h.store.Put(&store.Job{ID: "done", Status: store.StatusSucceeded, CreatedAt: time.Now()})
+	mk("work-active", map[string]string{LabelApp: AppName, LabelJobID: "active"})
+	mk("work-done", map[string]string{LabelApp: AppName, LabelJobID: "done"})
+	mk("work-unknown", map[string]string{LabelApp: AppName, LabelJobID: "ghost"}) // previous controller instance
+	mk("work-nolabel", map[string]string{LabelApp: AppName})
 	mk("unrelated", map[string]string{"app": "something-else"})
 
-	n, err := h.sp.CleanupOrphans(ctx)
-	if err != nil || n != 2 {
+	n, err := h.sp.Sweep(ctx)
+	if err != nil || n != 3 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
-	h.assertPodGone(t, "work-old-1")
-	h.assertPodGone(t, "work-old-2")
-	if _, err := h.client.CoreV1().Pods(testNS).Get(ctx, "unrelated", metav1.GetOptions{}); err != nil {
-		t.Fatalf("unrelated pod must survive: %v", err)
+	for _, gone := range []string{"work-done", "work-unknown", "work-nolabel"} {
+		h.assertPodGone(t, gone)
+	}
+	for _, keep := range []string{"work-active", "unrelated"} {
+		if _, err := h.client.CoreV1().Pods(testNS).Get(ctx, keep, metav1.GetOptions{}); err != nil {
+			t.Fatalf("%s must survive the sweep: %v", keep, err)
+		}
+	}
+}
+
+func TestSweepKeepsFailedPodsWhenConfigured(t *testing.T) {
+	h := newHarness(t, Config{KeepFailedPods: true})
+	ctx := context.Background()
+	h.store.Put(&store.Job{ID: "bad", Status: store.StatusFailed, CreatedAt: time.Now()})
+	_, err := h.client.CoreV1().Pods(testNS).Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "work-bad", Labels: map[string]string{LabelApp: AppName, LabelJobID: "bad"}}}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := h.sp.Sweep(ctx); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if _, err := h.client.CoreV1().Pods(testNS).Get(ctx, "work-bad", metav1.GetOptions{}); err != nil {
+		t.Fatalf("kept failed pod must survive the sweep: %v", err)
 	}
 }
 
@@ -402,4 +438,169 @@ func TestRunFinishedBeforeWatch(t *testing.T) {
 		t.Fatalf("no watch should have been needed, got %d", h.watchCount())
 	}
 	h.assertPodGone(t, j.PodName)
+}
+
+func TestRunRetriesTransientGetErrors(t *testing.T) {
+	h := newHarness(t, Config{})
+	var failures atomic.Int32
+	failures.Store(2) // the first two GETs fail with a 500
+	h.client.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if failures.Add(-1) >= 0 {
+			return true, nil, apierrors.NewInternalError(errors.New("etcd leader changed"))
+		}
+		return false, nil, nil
+	})
+	done := h.submit(t, "job9", store.WorkSpec{Image: "busybox"})
+	h.awaitWatch(t)
+
+	pod := h.workerPod(t, "job9")
+	h.finishPod(t, pod, corev1.PodSucceeded, 0)
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job9")
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status = %s err=%q", j.Status, j.Error)
+	}
+	if failures.Load() >= 0 {
+		t.Fatal("injected failures were not consumed; retry path not exercised")
+	}
+	h.assertPodGone(t, pod.Name)
+}
+
+func TestRunFailsWhenAPIStaysDown(t *testing.T) {
+	h := newHarness(t, Config{APIRetryWindow: 100 * time.Millisecond})
+	var down atomic.Bool
+	down.Store(true)
+	h.client.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if down.Load() {
+			return true, nil, apierrors.NewServiceUnavailable("apiserver restarting")
+		}
+		return false, nil, nil
+	})
+	done := h.submit(t, "job10", store.WorkSpec{Image: "busybox"})
+	waitDone(t, done)
+	down.Store(false)
+
+	j, _ := h.store.Get("job10")
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "get pod") {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	h.assertPodGone(t, j.PodName)
+}
+
+func TestRunImagePullBackOffFailsFast(t *testing.T) {
+	h := newHarness(t, Config{ImagePullTimeout: 100 * time.Millisecond})
+	done := h.submit(t, "job11", store.WorkSpec{Image: "nope:latest"})
+	h.awaitWatch(t)
+
+	pod := h.workerPod(t, "job11")
+	pod.Spec.NodeName = "worker-1"
+	pod.Status.Phase = corev1.PodPending
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  ContainerName,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: `Back-off pulling image "nope:latest"`}},
+	}}
+	if _, err := h.client.CoreV1().Pods(testNS).Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job11")
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "within 100ms") || !strings.Contains(j.Error, "ImagePullBackOff") {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	if j.NodeName != "worker-1" {
+		t.Errorf("nodeName = %q", j.NodeName)
+	}
+	h.assertPodGone(t, pod.Name)
+}
+
+func TestRunInvalidImageNameFailsImmediately(t *testing.T) {
+	h := newHarness(t, Config{ImagePullTimeout: time.Hour})
+	done := h.submit(t, "job12", store.WorkSpec{Image: "NOT valid"})
+	h.awaitWatch(t)
+
+	pod := h.workerPod(t, "job12")
+	pod.Spec.NodeName = "worker-1"
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  ContainerName,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "InvalidImageName", Message: "couldn't parse image name"}},
+	}}
+	if _, err := h.client.CoreV1().Pods(testNS).Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job12")
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "InvalidImageName") {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	h.assertPodGone(t, pod.Name)
+}
+
+func TestCreateRetryAdoptsExistingPod(t *testing.T) {
+	h := newHarness(t, Config{})
+	ctx := context.Background()
+	// A pod from a create whose response was lost: already finished.
+	prior := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "work-job13-prior", Labels: map[string]string{LabelApp: AppName, LabelJobID: "job13"}},
+		Spec:       corev1.PodSpec{NodeName: "worker-1"},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded, ContainerStatuses: []corev1.ContainerStatus{{
+			Name: ContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}}}},
+	}
+	if _, err := h.client.CoreV1().Pods(testNS).Create(ctx, prior, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var creates atomic.Int32
+	h.client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		creates.Add(1)
+		return true, nil, apierrors.NewInternalError(errors.New("response lost"))
+	})
+
+	done := h.submit(t, "job13", store.WorkSpec{Image: "busybox"})
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job13")
+	if j.Status != store.StatusSucceeded || j.PodName != "work-job13-prior" {
+		t.Fatalf("got %+v", j)
+	}
+	if n := creates.Load(); n != 1 {
+		t.Fatalf("create called %d times, want 1: the retry must adopt the existing pod", n)
+	}
+	h.assertPodGone(t, "work-job13-prior")
+}
+
+func TestDeletePodForceDeletesStuckPod(t *testing.T) {
+	h := newHarness(t, Config{})
+	ctx := context.Background()
+	gvr := corev1.SchemeGroupVersion.WithResource("pods")
+	if _, err := h.client.CoreV1().Pods(testNS).Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "stuck", Labels: map[string]string{LabelApp: AppName}}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var forced atomic.Bool
+	h.client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		del := action.(k8stesting.DeleteAction)
+		if g := del.GetDeleteOptions().GracePeriodSeconds; g != nil && *g == 0 {
+			forced.Store(true)
+			return false, nil, nil // let the tracker really delete it
+		}
+		// Graceful delete on a node whose kubelet is gone: the API server
+		// only sets deletionTimestamp and the object never disappears.
+		obj, err := h.client.Tracker().Get(gvr, testNS, del.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		p := obj.(*corev1.Pod)
+		now := metav1.Now()
+		p.DeletionTimestamp = &now
+		return true, nil, h.client.Tracker().Update(gvr, p, testNS)
+	})
+
+	h.sp.deletePod("stuck", h.sp.log)
+
+	if !forced.Load() {
+		t.Fatal("expected a force delete after the graceful delete stalled")
+	}
+	h.assertPodGone(t, "stuck")
 }

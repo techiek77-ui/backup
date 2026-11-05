@@ -50,6 +50,15 @@ spec:
             # Fail fast when no node matches the selector.
             - name: WORKER_SCHEDULE_TIMEOUT
               value: 2m
+            # Fail fast when the worker image cannot be pulled.
+            - name: WORKER_IMAGE_PULL_TIMEOUT
+              value: 3m
+            # Retry transient API-server errors this long before failing a job.
+            - name: API_RETRY_WINDOW
+              value: 2m
+            # Reap worker pods that no in-flight job owns.
+            - name: SWEEP_INTERVAL
+              value: 5m
             - name: MAX_CONCURRENT
               value: "10"
             - name: KEEP_FAILED_PODS

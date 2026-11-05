@@ -38,6 +38,8 @@ func TestFromEnv(t *testing.T) {
 	t.Setenv("WORKER_TOLERATIONS", `[{"key":"dedicated","operator":"Equal","value":"worker","effect":"NoSchedule"}]`)
 	t.Setenv("WORKER_IMAGE_PULL_SECRET", "ocirsecret, other")
 	t.Setenv("WORKER_DEFAULT_TIMEOUT", "90s")
+	t.Setenv("WORKER_IMAGE_PULL_TIMEOUT", "45s")
+	t.Setenv("SWEEP_INTERVAL", "1m")
 	t.Setenv("MAX_CONCURRENT", "3")
 	t.Setenv("KEEP_FAILED_PODS", "true")
 
@@ -50,6 +52,9 @@ func TestFromEnv(t *testing.T) {
 	}
 	if c.DefaultTimeout != 90*time.Second || c.ScheduleTimeout != 2*time.Minute {
 		t.Errorf("timeouts: %v %v", c.DefaultTimeout, c.ScheduleTimeout)
+	}
+	if c.ImagePullTimeout != 45*time.Second || c.SweepInterval != time.Minute || c.APIRetryWindow != 2*time.Minute {
+		t.Errorf("new durations: pull=%v sweep=%v retry=%v", c.ImagePullTimeout, c.SweepInterval, c.APIRetryWindow)
 	}
 	if len(c.Tolerations) != 1 || c.Tolerations[0].Key != "dedicated" || string(c.Tolerations[0].Effect) != "NoSchedule" {
 		t.Errorf("tolerations: %+v", c.Tolerations)
@@ -73,5 +78,10 @@ func TestFromEnvErrors(t *testing.T) {
 	t.Setenv("MAX_CONCURRENT", "0")
 	if _, err := FromEnv(); err == nil {
 		t.Error("MAX_CONCURRENT=0 should error")
+	}
+	t.Setenv("MAX_CONCURRENT", "")
+	t.Setenv("SWEEP_INTERVAL", "0s")
+	if _, err := FromEnv(); err == nil {
+		t.Error("SWEEP_INTERVAL=0 should error")
 	}
 }

@@ -235,42 +235,193 @@ one of the `workload=worker` nodes; afterwards it is gone.
 | `WORKER_DEFAULT_IMAGE` | `busybox:1.36` | Used when a request omits `image`. |
 | `WORKER_DEFAULT_TIMEOUT` | `10m` | Pod `activeDeadlineSeconds` when the request omits `timeoutSeconds`. |
 | `WORKER_SCHEDULE_TIMEOUT` | `2m` | Fail the job if the pod is still unscheduled after this long. |
+| `WORKER_IMAGE_PULL_TIMEOUT` | `3m` | Fail the job if its image is still unpullable (`ErrImagePull` / `ImagePullBackOff`) after this long; `InvalidImageName` fails at once. |
+| `API_RETRY_WINDOW` | `2m` | Retry transient API-server errors (5xx, timeouts, connection failures) for this long before failing a job. |
+| `SWEEP_INTERVAL` | `5m` | How often worker pods that no in-flight job owns are reaped. |
 | `MAX_CONCURRENT` | `10` | Max simultaneous worker pods; extra requests queue as `Pending`. |
 | `MAX_LOG_BYTES` | `65536` | Log bytes kept per job. |
 | `KEEP_FAILED_PODS` | `false` | Leave failed pods in place for debugging. |
 | `PORT` | `8080` | HTTP port. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
-## How a job runs
+## How it works
 
-1. `POST /work` stores the job as `Pending` and starts a goroutine (queued if
-   `MAX_CONCURRENT` pods are already running).
-2. The goroutine creates a Pod `work-<id>-xxxxx` with `restartPolicy: Never`,
-   `activeDeadlineSeconds`, the node selector/tolerations, labels
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant K as Controller pod
+    participant A as API server
+    participant N as Labelled node
+    C->>K: POST /work {image, command}
+    K-->>C: 202 Accepted {id, status: Pending}
+    K->>A: create Pod work-id-xxxxx (nodeSelector, restartPolicy Never, activeDeadlineSeconds)
+    A->>N: scheduler binds to a workload=worker node; kubelet pulls image, runs it
+    K->>A: GET + watch the pod (resumed if the watch drops)
+    A-->>K: status events, copied to job.message (Unschedulable, ImagePullBackOff, ...)
+    N-->>A: container exits: phase Succeeded or Failed
+    A-->>K: terminal event
+    K->>A: read logs, record exit code and node
+    K->>A: delete Pod, confirm it is gone (force-delete if stuck Terminating)
+    C->>K: GET /work/{id}
+    K-->>C: {status, nodeName, exitCode, logs, error}
+```
+
+1. **Accept.** `POST /work` validates the body, stores the job as `Pending` and
+   returns `202` at once. A goroutine takes a slot from the `MAX_CONCURRENT`
+   semaphore; requests beyond the cap wait in memory as `Pending`.
+2. **Create.** The goroutine creates one Pod `work-<id>-xxxxx` with
+   `restartPolicy: Never`, `activeDeadlineSeconds`, the node selector and
+   tolerations, the pull secrets, small resource requests/limits, labels
    `app.kubernetes.io/name=podspawner-worker` and `podspawner.io/job-id=<id>`,
-   small resource requests/limits, and no service-account token.
-3. It watches that single pod. Scheduling failures and image-pull errors are
-   copied into the job's `message`; a pod that is never scheduled is given up
-   after `WORKER_SCHEDULE_TIMEOUT` (`activeDeadlineSeconds` only starts once a
-   kubelet has accepted the pod, so it would otherwise hang forever). Watches
-   the API server closes are resumed from a fresh GET, so long jobs are safe.
-4. On `Succeeded`/`Failed` it reads the container logs and exit code, records
-   them, and **deletes the pod** (always — also on timeouts, errors and
-   controller shutdown; the only exception is `KEEP_FAILED_PODS=true`).
-5. On start-up the controller deletes any pod carrying its worker label that a
-   previous instance left behind. The Deployment uses `strategy: Recreate` so
-   two controllers never overlap.
+   and no service-account token. Transient API errors are retried with
+   back-off for `API_RETRY_WINDOW`; a retry first looks for a pod already
+   carrying the job's label and adopts it, so a lost response never produces
+   a duplicate pod.
+3. **Watch.** The controller GETs the pod, then watches it from that resource
+   version so no event is missed. Scheduling conditions and container
+   `Waiting` reasons are copied to the job's `message`. Three things can end
+   the wait early: no node after `WORKER_SCHEDULE_TIMEOUT`, an unpullable
+   image after `WORKER_IMAGE_PULL_TIMEOUT` (`InvalidImageName` immediately),
+   or the internal backstop 30 s past the pod's own deadline. A watch the API
+   server closes, or that expires with `410 Gone`, is re-established from a
+   fresh GET; API errors on the GET/watch are retried like the create.
+4. **Collect.** On `Succeeded` or `Failed` the controller reads the container
+   logs (capped at `MAX_LOG_BYTES`), the exit code and the node, and records
+   the failure reason (`DeadlineExceeded`, `Evicted: ...`, `OOMKilled (exit
+   code 137)`, `container exited with code N`).
+5. **Delete.** Always, also on timeouts, errors and controller shutdown
+   (exception: `KEEP_FAILED_PODS=true` keeps failed pods). The delete is
+   graceful, then confirmed by polling for up to 45 s; a pod that is still
+   `Terminating` after that, the signature of a node whose kubelet is gone,
+   is force-deleted (`gracePeriodSeconds: 0`).
+6. **Sweep.** On start-up and every `SWEEP_INTERVAL` the controller lists pods
+   with the worker label and deletes any whose job is unknown or already
+   finished (pods kept by `KEEP_FAILED_PODS` are left alone). Start-up
+   therefore clears everything a previous instance left behind, and later
+   sweeps catch the rare pod whose delete failed during an API-server outage.
+7. **Boundaries.** RBAC is namespace-scoped: `create/get/list/watch/delete`
+   on pods and `get` on `pods/log`, nothing else. The Deployment runs one
+   replica with `strategy: Recreate` so two controllers never overlap (the
+   new one's start-up sweep would otherwise delete the old one's pods).
 
-RBAC is namespace-scoped: the controller may `create/get/list/watch/delete`
-pods and `get` pod logs in its own namespace only.
+## What happens when a node or node pool is unavailable
+
+The controller never retries a job. Every scenario below ends with the job
+`Failed`, an `error` that says why, and the worker pod removed; the only
+variable is how long it takes, which these timers govern:
+
+| Timer | Default | Fires when |
+| --- | --- | --- |
+| `WORKER_SCHEDULE_TIMEOUT` | 2 min | the pod still has no node |
+| `WORKER_IMAGE_PULL_TIMEOUT` | 3 min | the pod has a node but its image cannot be pulled |
+| `activeDeadlineSeconds` | request `timeoutSeconds`, else `WORKER_DEFAULT_TIMEOUT` (10 min) | the pod runs too long; enforced by the kubelet, so it counts only once the pod has started |
+| internal backstop | deadline + 30 s | the kubelet never enforces the deadline (node lost after binding) |
+| `API_RETRY_WINDOW` | 2 min | the API server keeps failing a create/get/watch/delete |
+| delete confirmation | 45 s | a deleted pod is still `Terminating`; then it is force-deleted |
+| `SWEEP_INTERVAL` | 5 min | catch-all for any worker pod the above did not remove |
+
+### The pod cannot be placed
+
+Cases: node pool not created yet, label missing or wrong, pool scaled to zero,
+all nodes full (`Insufficient cpu/memory`), tainted pool without
+`WORKER_TOLERATIONS`, nodes cordoned or NotReady, the autoscaler unable to add
+nodes (OCI `Out of host capacity`, common on A1 shapes).
+
+* `POST /work` still returns `202`: the API server accepts the Pod and
+  scheduling is asynchronous. The job shows `Running` with an empty `nodeName`.
+* Within seconds the scheduler sets `PodScheduled=False` and the job's
+  `message` shows its reason, e.g. `Unschedulable: 0/3 nodes are available: 3
+  node(s) didn't match Pod's node affinity/selector ...` or `... had untolerated
+  taint {dedicated: worker}`.
+* `activeDeadlineSeconds` does not tick for an unscheduled pod, which is why the
+  schedule timer exists. After `WORKER_SCHEDULE_TIMEOUT` the job is `Failed`
+  with `pod was not scheduled within 2m0s: Unschedulable: ...`, the Pending pod
+  is deleted (instant, nothing to stop) and the concurrency slot is released.
+* **Autoscaler from zero / scale-up (OKE):** the pending pod does trigger a
+  scale-up because it has resource requests, but a new OKE node takes several
+  minutes to boot and join. With the 2-minute default the job fails and the
+  pod is deleted before the node is Ready, and the node may then sit idle until
+  scale-down. Raise `WORKER_SCHEDULE_TIMEOUT` above the observed provisioning
+  time when relying on this.
+* **Back-pressure is queueing, not rejection:** with `MAX_CONCURRENT=10`, up to
+  ten unschedulable pods occupy slots for the schedule timeout each; further
+  requests queue in memory as `Pending`. The API never answers "no".
+
+### The node disappears while the pod is running
+
+* **Abrupt loss** (VM crash, preemptible instance reclaimed, node pool deleted
+  without drain): the node goes NotReady after roughly 40–50 s; Kubernetes
+  evicts the pod after the default 5-minute `not-ready`/`unreachable`
+  toleration, but with no kubelet to confirm, the pod sits in `Terminating`.
+  The controller keeps watching until the backstop (default ~10.5 min), then
+  the job is `Failed` with `timed out after 10m30s waiting for pod to finish`
+  and no logs. The delete is confirmed for 45 s and the stuck pod is then
+  force-deleted. If the Node object is removed first (OKE's cloud controller
+  deletes it once the instance is gone and pod GC reaps the pod), the
+  controller sees the deletion instead and the error reads `pod was deleted
+  externally`.
+* **Graceful drain, OKE node cycling, node pool delete with drain:** the pod is
+  evicted; the container gets SIGTERM, then SIGKILL after 30 s (a `sh -c ...;
+  sleep` ignores SIGTERM). Depending on timing the controller catches either
+  the terminal state (`container exited with code 137`, logs captured) or the
+  deletion (`pod was deleted externally`, no logs). The pod is removed either
+  way.
+* **Node-pressure eviction** (`Evicted: The node was low on resource: memory`)
+  and **OOMKilled** (`OOMKilled (exit code 137)`): the pod reaches `Failed`
+  normally; the job records that reason with logs, and the pod is deleted.
+
+### The controller itself
+
+* **Controller node dies / controller restarted:** the Deployment reschedules
+  it on any node (it has no node selector). In-memory jobs are lost, so
+  `GET /work/{id}` for them returns `404`, and the start-up sweep deletes every
+  worker pod carrying the label, including ones mid-run. `strategy: Recreate`
+  keeps two controllers from overlapping.
+* **Controller SIGTERM** (rollout, drain): in-flight jobs end `Failed: context
+  canceled` and their pods are deleted; queued jobs end `Failed: controller
+  shutting down before job started`.
+* **API-server blips** (OKE control-plane maintenance, leader change): the
+  create, GET, watch and delete calls are retried with back-off for
+  `API_RETRY_WINDOW` before a job is failed. A delete that still fails is
+  retried by the next sweep, so an outage cannot leak a running pod.
+
+### Watching it happen
+
+`GET /work/{id}` (`message` while in flight, `error` afterwards), the
+controller log (`kubectl -n podspawner logs deploy/podspawner`), and
+`kubectl -n podspawner get events --sort-by=.lastTimestamp`.
+
+## Design notes
+
+* **Bare Pods, not Jobs.** A Pod is the smallest unit and gives the controller
+  direct control over the lifecycle it has to explain to the caller: it
+  watches one object, reads its logs before deleting it, and has no TTL
+  controller or retry policy acting behind its back. A `Job` would add
+  `backoffLimit` retries and `ttlSecondsAfterFinished` cleanup that survive a
+  controller restart; that is the first change to make when moving past a
+  PoC.
+* **A Deployment, not a StatefulSet, for the controller.** Nothing here needs a
+  stable network identity or per-replica storage, so a one-replica Deployment
+  with `Recreate` is the simplest correct shape. A StatefulSet becomes
+  relevant when job state must survive restarts: a StatefulSet with a PVC
+  (on OKE an OCI Block Volume via the default `oci-bv` StorageClass) holding
+  an embedded database would let the controller re-adopt running pods after
+  a restart instead of deleting them. The alternative is to represent each
+  request as a custom resource, which also gives `kubectl get` visibility and
+  needs no volume.
+* **Workers are never StatefulSets.** Work items have no identity or storage to
+  preserve; if one ever needs a volume, a `Job` with a PVC is the right tool.
 
 ## Known limitations (it is a PoC)
 
-* Job state is in-memory: a controller restart forgets jobs and aborts in-flight
-  work. Persist jobs, or model each request as a Kubernetes `Job`/CRD, for
-  anything beyond a PoC.
-* No authentication/authorization on the API, and callers choose the image and
-  command — treat the endpoint as trusted-network only.
+* Job state is in memory: a controller restart forgets jobs, aborts in-flight
+  work and returns `404` for earlier IDs. Persist jobs (StatefulSet + PVC, or a
+  CRD) for anything beyond a PoC; see Design notes.
+* No authentication or authorization on the API, and callers choose the image
+  and command: treat the endpoint as trusted-network only.
+* Failed work is not retried automatically; the client resubmits.
+* The request queue is unbounded and in memory.
 * Logs are capped at `MAX_LOG_BYTES` and kept in memory.
 
 ## Sources consulted

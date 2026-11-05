@@ -47,10 +47,22 @@ type Config struct {
 	// up. Pods that never get a node would otherwise hang forever, since
 	// activeDeadlineSeconds only counts once a kubelet has picked them up.
 	ScheduleTimeout time.Duration
+	// ImagePullTimeout fails a job whose image has been unpullable
+	// (ErrImagePull / ImagePullBackOff) for this long instead of waiting for
+	// activeDeadlineSeconds. Permanent pull errors fail immediately.
+	ImagePullTimeout time.Duration
+	// APIRetryWindow is how long transient API-server errors (5xx, timeouts,
+	// connection failures) are retried before a job is failed.
+	APIRetryWindow time.Duration
 	// MaxLogBytes caps how much log we keep per job.
 	MaxLogBytes int64
 	// KeepFailedPods leaves failed pods around for debugging instead of deleting.
 	KeepFailedPods bool
+
+	// Tunables for tests; zero means the production default.
+	retryBase    time.Duration // first retry backoff (1s)
+	deleteWait   time.Duration // wait for a graceful delete to complete (45s)
+	pollInterval time.Duration // delete confirmation poll interval (2s)
 }
 
 type Spawner struct {
@@ -61,12 +73,18 @@ type Spawner struct {
 }
 
 func New(client kubernetes.Interface, cfg Config, st *store.Store, log *slog.Logger) *Spawner {
-	if cfg.DefaultTimeout <= 0 {
-		cfg.DefaultTimeout = 10 * time.Minute
+	def := func(d *time.Duration, v time.Duration) {
+		if *d <= 0 {
+			*d = v
+		}
 	}
-	if cfg.ScheduleTimeout <= 0 {
-		cfg.ScheduleTimeout = 2 * time.Minute
-	}
+	def(&cfg.DefaultTimeout, 10*time.Minute)
+	def(&cfg.ScheduleTimeout, 2*time.Minute)
+	def(&cfg.ImagePullTimeout, 3*time.Minute)
+	def(&cfg.APIRetryWindow, 2*time.Minute)
+	def(&cfg.retryBase, time.Second)
+	def(&cfg.deleteWait, 45*time.Second)
+	def(&cfg.pollInterval, 2*time.Second)
 	if cfg.MaxLogBytes <= 0 {
 		cfg.MaxLogBytes = 64 * 1024
 	}
@@ -144,14 +162,12 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 	}
 	log := s.log.With("job", jobID)
 
-	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
-	created, err := pods.Create(ctx, s.BuildPod(job), metav1.CreateOptions{})
+	created, err := s.createPod(ctx, job, log)
 	if err != nil {
-		s.fail(jobID, "", fmt.Errorf("create pod: %w", err))
+		s.fail(jobID, "", err)
 		return
 	}
 	log = log.With("pod", created.Name)
-	log.Info("worker pod created")
 
 	now := time.Now()
 	s.store.Update(jobID, func(j *store.Job) {
@@ -209,6 +225,70 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 	}
 }
 
+// createPod submits the worker pod, retrying transient API errors. A retry
+// first looks for a pod already labelled with this job ID — the previous
+// request may have succeeded while its response was lost — and adopts it
+// rather than creating a duplicate.
+func (s *Spawner) createPod(ctx context.Context, job *store.Job, log *slog.Logger) (*corev1.Pod, error) {
+	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
+	var created *corev1.Pod
+	attempt := 0
+	err := s.retry(ctx, "create pod", func() error {
+		attempt++
+		if attempt > 1 {
+			if existing, err := s.findPodForJob(ctx, job.ID); err == nil && existing != nil {
+				log.Warn("adopting worker pod created by an earlier attempt", "pod", existing.Name)
+				created = existing
+				return nil
+			}
+		}
+		p, err := pods.Create(ctx, s.BuildPod(job), metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+		created = p
+		log.Info("worker pod created", "pod", p.Name)
+		return nil
+	})
+	return created, err
+}
+
+func (s *Spawner) findPodForJob(ctx context.Context, jobID string) (*corev1.Pod, error) {
+	list, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: LabelJobID + "=" + jobID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(list.Items) == 0 {
+		return nil, nil
+	}
+	return &list.Items[0], nil
+}
+
+// podState is what the watcher has learned about the pod so far.
+type podState struct {
+	scheduled        bool
+	message          string    // latest scheduling / waiting reason
+	pullReason       string    // non-empty while the image cannot be pulled
+	pullFailingSince time.Time // when pullReason first appeared
+}
+
+// imagePullFailure returns a job error once the image has been unpullable
+// for longer than timeout, or immediately for permanent failures.
+func (st *podState) imagePullFailure(timeout time.Duration) string {
+	switch st.pullReason {
+	case "":
+		return ""
+	case "InvalidImageName", "ErrImageNeverPull":
+		return "image cannot be pulled: " + st.message
+	}
+	if time.Since(st.pullFailingSince) < timeout {
+		return ""
+	}
+	return fmt.Sprintf("image could not be pulled within %s: %s", timeout, st.message)
+}
+
 // waitForCompletion follows a single pod until it reaches a terminal phase.
 //
 // The API server closes long-lived watches periodically and answers watches
@@ -216,34 +296,54 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 // is never treated as a job failure: the pod is re-read with a GET (which
 // also catches pods that finished before the watch was established) and a
 // new watch is started from the GET's resource version, leaving no gap.
+// Transient API errors on the GET and the watch are retried.
 func (s *Spawner) waitForCompletion(ctx context.Context, jobID, name string) (*corev1.Pod, error) {
 	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
 
 	schedTimer := time.NewTimer(s.cfg.ScheduleTimeout)
 	defer schedTimer.Stop()
-	scheduled := false
+	st := &podState{}
 
 	for attempt := 0; ; attempt++ {
-		cur, err := pods.Get(ctx, name, metav1.GetOptions{})
+		var cur *corev1.Pod
+		err := s.retry(ctx, "get pod", func() error {
+			p, err := pods.Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			cur = p
+			return nil
+		})
 		if err != nil {
-			return nil, fmt.Errorf("get pod: %w", err)
+			if apierrors.IsNotFound(err) {
+				return nil, errors.New("pod was deleted externally")
+			}
+			return nil, err
 		}
 		if isTerminal(cur) {
 			return cur, nil
 		}
-		if cur.Spec.NodeName != "" {
-			scheduled = true
+		s.observe(jobID, cur, st)
+		if msg := st.imagePullFailure(s.cfg.ImagePullTimeout); msg != "" {
+			return nil, errors.New(msg)
 		}
-		s.observe(jobID, cur)
 
-		w, err := pods.Watch(ctx, metav1.ListOptions{
-			FieldSelector:   fields.OneTermEqualSelector("metadata.name", name).String(),
-			ResourceVersion: cur.ResourceVersion,
+		var w watch.Interface
+		err = s.retry(ctx, "watch pod", func() error {
+			ww, err := pods.Watch(ctx, metav1.ListOptions{
+				FieldSelector:   fields.OneTermEqualSelector("metadata.name", name).String(),
+				ResourceVersion: cur.ResourceVersion,
+			})
+			if err != nil {
+				return err
+			}
+			w = ww
+			return nil
 		})
 		if err != nil {
-			return nil, fmt.Errorf("watch pod: %w", err)
+			return nil, err
 		}
-		final, retry, err := s.consumeWatch(ctx, w, jobID, name, &scheduled, schedTimer)
+		final, retry, err := s.consumeWatch(ctx, w, jobID, name, st, schedTimer)
 		w.Stop()
 		if err != nil || final != nil {
 			return final, err
@@ -263,21 +363,38 @@ func (s *Spawner) waitForCompletion(ctx context.Context, jobID, name string) (*c
 
 // consumeWatch drains events until the pod is terminal (returned), the watch
 // is closed or expired (retry=true), or something fatal happens (err).
-func (s *Spawner) consumeWatch(ctx context.Context, w watch.Interface, jobID, name string, scheduled *bool, schedTimer *time.Timer) (*corev1.Pod, bool, error) {
+func (s *Spawner) consumeWatch(ctx context.Context, w watch.Interface, jobID, name string, st *podState, schedTimer *time.Timer) (*corev1.Pod, bool, error) {
+	// Image-pull back-off produces status updates only sporadically, so the
+	// pull deadline is also checked on a ticker.
+	pullCheck := s.cfg.ImagePullTimeout / 4
+	if pullCheck < 50*time.Millisecond {
+		pullCheck = 50 * time.Millisecond
+	}
+	if pullCheck > 15*time.Second {
+		pullCheck = 15 * time.Second
+	}
+	ticker := time.NewTicker(pullCheck)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 
 		case <-schedTimer.C:
-			if *scheduled {
+			if st.scheduled {
 				continue
 			}
 			msg := fmt.Sprintf("pod was not scheduled within %s", s.cfg.ScheduleTimeout)
-			if j, ok := s.store.Get(jobID); ok && j.Message != "" {
-				msg += ": " + j.Message
+			if st.message != "" {
+				msg += ": " + st.message
 			}
 			return nil, false, errors.New(msg)
+
+		case <-ticker.C:
+			if msg := st.imagePullFailure(s.cfg.ImagePullTimeout); msg != "" {
+				return nil, false, errors.New(msg)
+			}
 
 		case ev, ok := <-w.ResultChan():
 			if !ok {
@@ -297,20 +414,21 @@ func (s *Spawner) consumeWatch(ctx context.Context, w watch.Interface, jobID, na
 			if !ok || p.Name != name {
 				continue
 			}
-			if p.Spec.NodeName != "" {
-				*scheduled = true
-			}
-			s.observe(jobID, p)
+			s.observe(jobID, p, st)
 			if isTerminal(p) {
 				return p, false, nil
+			}
+			if msg := st.imagePullFailure(s.cfg.ImagePullTimeout); msg != "" {
+				return nil, false, errors.New(msg)
 			}
 		}
 	}
 }
 
 // observe copies useful in-flight facts (node, scheduling or image-pull
-// problems) onto the job so GET /work/{id} explains what is going on.
-func (s *Spawner) observe(jobID string, p *corev1.Pod) {
+// problems) onto the job so GET /work/{id} explains what is going on, and
+// updates the watcher's state.
+func (s *Spawner) observe(jobID string, p *corev1.Pod, st *podState) {
 	msg := ""
 	for _, c := range p.Status.Conditions {
 		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse {
@@ -320,14 +438,33 @@ func (s *Spawner) observe(jobID string, p *corev1.Pod) {
 			}
 		}
 	}
+	pullReason := ""
 	for _, cs := range p.Status.ContainerStatuses {
-		if cs.Name == ContainerName && cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
-			msg = cs.State.Waiting.Reason
-			if cs.State.Waiting.Message != "" {
-				msg += ": " + cs.State.Waiting.Message
-			}
+		if cs.Name != ContainerName || cs.State.Waiting == nil || cs.State.Waiting.Reason == "" {
+			continue
+		}
+		msg = cs.State.Waiting.Reason
+		if cs.State.Waiting.Message != "" {
+			msg += ": " + cs.State.Waiting.Message
+		}
+		switch cs.State.Waiting.Reason {
+		case "ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull":
+			pullReason = cs.State.Waiting.Reason
 		}
 	}
+
+	if p.Spec.NodeName != "" {
+		st.scheduled = true
+	}
+	st.message = msg
+	switch {
+	case pullReason == "":
+		st.pullFailingSince = time.Time{}
+	case st.pullReason == "":
+		st.pullFailingSince = time.Now()
+	}
+	st.pullReason = pullReason
+
 	s.store.Update(jobID, func(j *store.Job) {
 		if p.Spec.NodeName != "" {
 			j.NodeName = p.Spec.NodeName
@@ -355,25 +492,74 @@ func (s *Spawner) fetchLogs(ctx context.Context, name string, log *slog.Logger) 
 	return string(b)
 }
 
+// deletePod removes a worker pod. It requests a graceful delete, confirms the
+// pod is gone, and force-deletes (grace period 0) a pod that stays
+// Terminating past deleteWait — what happens when the node's kubelet is gone
+// and can no longer acknowledge the deletion. Cleanup never depends on the
+// (possibly cancelled) job context.
 func (s *Spawner) deletePod(name string, log *slog.Logger) {
-	// Cleanup must not depend on the (possibly cancelled) job context.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*s.cfg.deleteWait+s.cfg.APIRetryWindow)
 	defer cancel()
+	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
 	policy := metav1.DeletePropagationBackground
-	err := s.client.CoreV1().Pods(s.cfg.Namespace).Delete(ctx, name, metav1.DeleteOptions{
-		PropagationPolicy: &policy,
-	})
-	if err != nil {
-		log.Error("failed to delete worker pod", "err", err)
+
+	del := func(grace *int64) error {
+		return s.retry(ctx, "delete pod", func() error {
+			err := pods.Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &policy, GracePeriodSeconds: grace})
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		})
+	}
+
+	if err := del(nil); err != nil {
+		log.Error("failed to delete worker pod; the periodic sweep will retry", "err", err)
 		return
 	}
-	log.Info("worker pod deleted")
+	gone, stuck := s.awaitGone(ctx, name)
+	switch {
+	case gone:
+		log.Info("worker pod deleted")
+	case stuck:
+		zero := int64(0)
+		if err := del(&zero); err != nil {
+			log.Error("force delete failed; the periodic sweep will retry", "err", err)
+			return
+		}
+		log.Warn("worker pod stayed Terminating (node gone?); force-deleted")
+	default:
+		log.Warn("worker pod still present after delete; the periodic sweep will retry")
+	}
 }
 
-// CleanupOrphans deletes every worker pod carrying our label. It is called on
-// controller start-up: job state is in-memory, so pods left behind by a
-// previous instance can never be collected and would otherwise leak.
-func (s *Spawner) CleanupOrphans(ctx context.Context) (int, error) {
+// awaitGone polls until the pod disappears. stuck reports that it is still
+// present with a deletion timestamp once deleteWait has elapsed.
+func (s *Spawner) awaitGone(ctx context.Context, name string) (gone, stuck bool) {
+	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
+	deadline := time.Now().Add(s.cfg.deleteWait)
+	for {
+		p, err := pods.Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, false
+		}
+		if time.Now().After(deadline) {
+			return false, err == nil && p.DeletionTimestamp != nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, false
+		case <-time.After(s.cfg.pollInterval):
+		}
+	}
+}
+
+// Sweep deletes worker pods that no in-flight job owns: everything on
+// start-up (job state is in memory, so nothing left by a previous instance
+// can be collected), and later any pod whose job is unknown or already
+// finished — for example one whose delete failed during an API-server
+// outage. Failed pods kept by KeepFailedPods are left alone.
+func (s *Spawner) Sweep(ctx context.Context) (int, error) {
 	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
 	list, err := pods.List(ctx, metav1.ListOptions{LabelSelector: LabelApp + "=" + AppName})
 	if err != nil {
@@ -382,14 +568,78 @@ func (s *Spawner) CleanupOrphans(ctx context.Context) (int, error) {
 	n := 0
 	for i := range list.Items {
 		p := &list.Items[i]
-		if err := pods.Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
-			s.log.Warn("failed to delete orphan pod", "pod", p.Name, "err", err)
-			continue
+		jobID := p.Labels[LabelJobID]
+		if j, ok := s.store.Get(jobID); ok {
+			if !j.Status.Terminal() || (s.cfg.KeepFailedPods && j.Status == store.StatusFailed) {
+				continue
+			}
 		}
-		s.log.Info("deleted orphan worker pod", "pod", p.Name, "phase", p.Status.Phase)
+		s.log.Warn("deleting orphan worker pod", "pod", p.Name, "phase", p.Status.Phase, "job", jobID)
+		s.deletePod(p.Name, s.log.With("pod", p.Name))
 		n++
 	}
 	return n, nil
+}
+
+// RunSweeper calls Sweep every interval until ctx is cancelled.
+func (s *Spawner) RunSweeper(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n, err := s.Sweep(ctx); err != nil {
+				s.log.Warn("sweep failed", "err", err)
+			} else if n > 0 {
+				s.log.Warn("sweep deleted orphan worker pods", "count", n)
+			}
+		}
+	}
+}
+
+// retry runs op until it succeeds, fails permanently, or the retry window
+// elapses. Only API-server/network-style failures are retried.
+func (s *Spawner) retry(ctx context.Context, what string, op func() error) error {
+	deadline := time.Now().Add(s.cfg.APIRetryWindow)
+	delay := s.cfg.retryBase
+	for attempt := 1; ; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isTransient(err) || time.Now().Add(delay).After(deadline) {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		s.log.Warn("transient API error, retrying", "op", what, "attempt", attempt, "in", delay, "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay *= 2; delay > 15*time.Second {
+			delay = 15 * time.Second
+		}
+	}
+}
+
+// isTransient reports whether an API error is worth retrying: 5xx, server
+// timeouts, throttling and connection failures are; 4xx responses that
+// describe the request or the object's state are not.
+func isTransient(err error) bool {
+	switch {
+	case apierrors.IsNotFound(err), apierrors.IsGone(err), apierrors.IsAlreadyExists(err),
+		apierrors.IsConflict(err), apierrors.IsForbidden(err), apierrors.IsUnauthorized(err),
+		apierrors.IsInvalid(err), apierrors.IsBadRequest(err), apierrors.IsMethodNotSupported(err),
+		apierrors.IsNotAcceptable(err), apierrors.IsUnsupportedMediaType(err),
+		apierrors.IsRequestEntityTooLargeError(err):
+		return false
+	}
+	return true
 }
 
 func (s *Spawner) fail(jobID, podName string, err error) {

@@ -51,6 +51,9 @@ func run() error {
 		"maxConcurrent", cfg.MaxConcurrent,
 		"defaultTimeout", cfg.DefaultTimeout,
 		"scheduleTimeout", cfg.ScheduleTimeout,
+		"imagePullTimeout", cfg.ImagePullTimeout,
+		"apiRetryWindow", cfg.APIRetryWindow,
+		"sweepInterval", cfg.SweepInterval,
 		"clientMode", mode,
 	)
 
@@ -66,17 +69,21 @@ func run() error {
 		ServiceAccount:   cfg.WorkerSA,
 		DefaultTimeout:   cfg.DefaultTimeout,
 		ScheduleTimeout:  cfg.ScheduleTimeout,
+		ImagePullTimeout: cfg.ImagePullTimeout,
+		APIRetryWindow:   cfg.APIRetryWindow,
 		MaxLogBytes:      cfg.MaxLogBytes,
 		KeepFailedPods:   cfg.KeepFailedPods,
 	}, st, log)
 
 	// Jobs are tracked in memory only, so anything left from a previous
-	// instance can never be collected. Reap it.
-	if n, err := sp.CleanupOrphans(ctx); err != nil {
-		return fmt.Errorf("startup cleanup: %w", err)
+	// instance can never be collected. Reap it now, then keep sweeping for
+	// pods whose delete failed (e.g. during an API-server outage).
+	if n, err := sp.Sweep(ctx); err != nil {
+		return fmt.Errorf("startup sweep: %w", err)
 	} else if n > 0 {
 		log.Warn("deleted orphaned worker pods from a previous run", "count", n)
 	}
+	go sp.RunSweeper(ctx, cfg.SweepInterval)
 
 	srv := api.New(ctx, st, sp, api.Options{
 		MaxConcurrent: cfg.MaxConcurrent,

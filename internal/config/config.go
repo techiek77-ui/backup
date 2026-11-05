@@ -25,6 +25,9 @@ type Config struct {
 	WorkerSA         string
 	DefaultTimeout   time.Duration
 	ScheduleTimeout  time.Duration
+	ImagePullTimeout time.Duration
+	APIRetryWindow   time.Duration
+	SweepInterval    time.Duration
 	MaxLogBytes      int64
 	MaxConcurrent    int
 	KeepFailedPods   bool
@@ -35,17 +38,20 @@ type Config struct {
 // FromEnv builds a Config, applying defaults for anything unset.
 func FromEnv() (Config, error) {
 	c := Config{
-		Port:            envInt("PORT", 8080),
-		Namespace:       envStr("POD_NAMESPACE", "podspawner"),
-		Kubeconfig:      os.Getenv("KUBECONFIG"),
-		WorkerSA:        os.Getenv("WORKER_SERVICE_ACCOUNT"),
-		MaxLogBytes:     int64(envInt("MAX_LOG_BYTES", 64*1024)),
-		MaxConcurrent:   envInt("MAX_CONCURRENT", 10),
-		KeepFailedPods:  envBool("KEEP_FAILED_PODS", false),
-		DefaultImage:    envStr("WORKER_DEFAULT_IMAGE", "busybox:1.36"),
-		LogLevel:        envStr("LOG_LEVEL", "info"),
-		DefaultTimeout:  10 * time.Minute,
-		ScheduleTimeout: 2 * time.Minute,
+		Port:             envInt("PORT", 8080),
+		Namespace:        envStr("POD_NAMESPACE", "podspawner"),
+		Kubeconfig:       os.Getenv("KUBECONFIG"),
+		WorkerSA:         os.Getenv("WORKER_SERVICE_ACCOUNT"),
+		MaxLogBytes:      int64(envInt("MAX_LOG_BYTES", 64*1024)),
+		MaxConcurrent:    envInt("MAX_CONCURRENT", 10),
+		KeepFailedPods:   envBool("KEEP_FAILED_PODS", false),
+		DefaultImage:     envStr("WORKER_DEFAULT_IMAGE", "busybox:1.36"),
+		LogLevel:         envStr("LOG_LEVEL", "info"),
+		DefaultTimeout:   10 * time.Minute,
+		ScheduleTimeout:  2 * time.Minute,
+		ImagePullTimeout: 3 * time.Minute,
+		APIRetryWindow:   2 * time.Minute,
+		SweepInterval:    5 * time.Minute,
 	}
 
 	var err error
@@ -57,6 +63,24 @@ func FromEnv() (Config, error) {
 	}
 	if c.ScheduleTimeout, err = envDuration("WORKER_SCHEDULE_TIMEOUT", c.ScheduleTimeout); err != nil {
 		return c, err
+	}
+	if c.ImagePullTimeout, err = envDuration("WORKER_IMAGE_PULL_TIMEOUT", c.ImagePullTimeout); err != nil {
+		return c, err
+	}
+	if c.APIRetryWindow, err = envDuration("API_RETRY_WINDOW", c.APIRetryWindow); err != nil {
+		return c, err
+	}
+	if c.SweepInterval, err = envDuration("SWEEP_INTERVAL", c.SweepInterval); err != nil {
+		return c, err
+	}
+	for name, d := range map[string]time.Duration{
+		"WORKER_DEFAULT_TIMEOUT": c.DefaultTimeout, "WORKER_SCHEDULE_TIMEOUT": c.ScheduleTimeout,
+		"WORKER_IMAGE_PULL_TIMEOUT": c.ImagePullTimeout, "API_RETRY_WINDOW": c.APIRetryWindow,
+		"SWEEP_INTERVAL": c.SweepInterval,
+	} {
+		if d <= 0 {
+			return c, fmt.Errorf("%s must be > 0", name)
+		}
 	}
 	if v := strings.TrimSpace(os.Getenv("WORKER_TOLERATIONS")); v != "" {
 		if err := json.Unmarshal([]byte(v), &c.Tolerations); err != nil {
