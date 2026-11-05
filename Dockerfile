@@ -4,7 +4,7 @@
 # OKE:    use linux/amd64 for x86 node pools (VM.Standard.E*, VM.Standard3),
 #         linux/arm64 for Ampere A1 node pools, or both for a multi-arch image.
 
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src

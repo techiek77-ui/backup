@@ -53,10 +53,65 @@ curl -s localhost:8080/work/<id>
 
 > The API has **no authentication**. It is exposed as a ClusterIP Service only;
 > reach it with `kubectl port-forward` or put an authenticating gateway in front.
+> Worker pods always run in the controller's own namespace (see Design notes
+> for the cross-namespace variant).
+
+## Prerequisites
+
+What dynamic spawn-and-tear-down of pods from another pod needs, wherever the
+cluster runs:
+
+**Cluster**
+
+* Any conformant Kubernetes cluster: OKE managed node pools, kind, and so on.
+  The controller uses only the stable `core/v1` Pod API (create, get, list,
+  watch, delete, logs), so it does not depend on a particular Kubernetes
+  minor version, a CRD, or an add-on. The Go client library is pinned in
+  `go.mod`.
+* RBAC enabled (the default everywhere) and the API server reachable from pods
+  at `kubernetes.default.svc`. The controller uses in-cluster configuration:
+  the ServiceAccount token projected into its pod plus the
+  `KUBERNETES_SERVICE_HOST`/`PORT` variables. If NetworkPolicies restrict
+  egress in the namespace, allow the controller to reach the API server.
+* At least one node carrying the worker label (`workload=worker` by default)
+  that can run pods: Ready, not cordoned, tolerating any taint on it (see
+  `WORKER_TOLERATIONS`), with room for the requests (50m CPU, 64Mi).
+* Nodes able to pull the worker images (Docker Hub through a NAT gateway, or
+  a mirror in OCIR with `WORKER_IMAGE_PULL_SECRET`) and the controller image
+  (OCIR with `ocirsecret`).
+
+**Permissions**
+
+* Whoever applies the manifests must be allowed to create the Role and
+  RoleBinding in the namespace. Kubernetes only lets you grant permissions you
+  already hold, so this is a namespace admin or `cluster-admin`; on OKE a
+  tenancy Administrator or a user bound to `cluster-admin` (step 0 below).
+* The controller itself needs only what `deploy/base/rbac.yaml` grants:
+  `pods` create/get/list/watch/delete and `pods/log` get, in its own
+  namespace. No cluster-wide permissions and no access to secrets or nodes.
+
+**Namespace policies that interact with pod creation**
+
+* `ResourceQuota`: worker pods always set requests and limits, so quotas that
+  require them are satisfied. An exhausted quota makes the create fail with
+  `403 Forbidden: exceeded quota ...`, which the job reports immediately.
+* `LimitRange`: defaults apply to worker pods like to any pod; a maximum below
+  500m CPU / 256Mi memory rejects them.
+* Pod Security Admission: the worker pod spec satisfies the `baseline` level.
+  Under `restricted` add a `securityContext` (non-root user, seccomp
+  `RuntimeDefault`, all capabilities dropped) in `BuildPod` and use images
+  that run as non-root. OKE enforces no level by default.
+* Admission policies (Kyverno, Gatekeeper, `ValidatingAdmissionPolicy`) can
+  mutate or reject worker pods; a rejection shows up as the job's `error`.
+
+**Tooling** (to build and deploy; nothing extra is needed at runtime): Go
+1.26 (any Go 1.21+ fetches it automatically), Docker (buildx for OKE images),
+`kubectl`, and for the local demo `kind`
+and `jq`.
 
 ## Quick start on kind
 
-Prerequisites: `docker`, `kind`, `kubectl`, `jq`, Go 1.24 (only for `make test`).
+Prerequisites: `docker`, `kind`, `kubectl`, `jq`, Go 1.26 (only for `make test`).
 
 ```bash
 make test
@@ -412,6 +467,39 @@ controller log (`kubectl -n podspawner logs deploy/podspawner`), and
   needs no volume.
 * **Workers are never StatefulSets.** Work items have no identity or storage to
   preserve; if one ever needs a volume, a `Job` with a PVC is the right tool.
+* **Is this the usual way to do it?** Yes, for the mechanism: an in-cluster
+  process authenticating with a ServiceAccount, scoped by RBAC, that creates a
+  pod per unit of work, watches it, collects its logs and deletes it is how
+  the Jenkins Kubernetes plugin, the GitLab Runner Kubernetes executor,
+  Airflow's `KubernetesPodOperator`, Argo Workflows and Tekton run their work;
+  a Spark driver creates its executor pods the same way. Three things separate
+  this PoC from those production controllers: they persist state (a database
+  or custom resources) rather than memory; most use informers (one shared
+  watch over all their pods with a local cache) or controller-runtime instead
+  of one watch per pod, which matters once hundreds of pods run at once; and
+  the ones that scale out run several replicas with leader election. None of
+  that changes the pod lifecycle described above. If a custom API is not a
+  requirement, two adopted off-the-shelf shapes cover the same need: a
+  Kubernetes `Job` per request, or KEDA's `ScaledJob` when requests arrive on
+  a queue (it creates a Job per message and scales to zero with no controller
+  code). For a long-running service that should grow with load the adopted
+  mechanism is different again: a Deployment with the Horizontal Pod
+  Autoscaler or KEDA, not a pod per request.
+* **One namespace.** The controller creates, watches, sweeps and deletes worker
+  pods in its own namespace only (`POD_NAMESPACE`, injected from the pod's
+  metadata), and its RBAC is a namespaced `Role`. Everything the workers rely
+  on, the `podspawner-worker` ServiceAccount, pull secrets, quotas and
+  policies, lives in that namespace. To run workers in other namespaces you
+  need, per target namespace: a `RoleBinding` granting the controller's
+  ServiceAccount the same verbs (bind one `ClusterRole` through per-namespace
+  `RoleBinding`s rather than a `ClusterRoleBinding`, so the grant stays
+  limited to namespaces you chose), the worker ServiceAccount and pull
+  secrets, and headroom in that namespace's quota and policies. In the code:
+  an optional `namespace` field on the request checked against an allowlist,
+  the spawner taking the namespace from the job, and one sweep per allowed
+  namespace. A `ClusterRoleBinding` is the quick alternative, but it gives the
+  controller pod rights in every namespace, including ones it should never
+  touch.
 
 ## Known limitations (it is a PoC)
 
