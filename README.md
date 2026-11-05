@@ -42,7 +42,7 @@ pod's resources and which pool/shape serves it.
 | `deploy/overlays/oke` | OKE overlay, nodes provided by an autoscaler: OCIR image, pull secret, node selector; optional internal OCI LB |
 | `deploy/overlays/oke-managed-nodes` | OKE overlay, controller-managed nodes (`NODE_MODE=oke`) with its IAM README |
 | `deploy/addons` | Cluster Autoscaler manifest, Karpenter NodePools/OCINodeClasses, virtual-node notes |
-| `hack/` | `kind-up.sh` (cluster + label + build + deploy), `demo.sh` (end-to-end run) |
+| `hack/` | `kind-up.sh` (cluster + label + build + deploy), `demo.sh` (end-to-end run), `oke-preflight.sh` (node pool checks for oke mode) |
 
 ## API
 
@@ -51,6 +51,9 @@ pod's resources and which pool/shape serves it.
 | `POST /work` | Submit work. Body: `{"image":"busybox:1.36","command":["sh","-c","echo hi"],"args":[],"timeoutSeconds":120,"size":"small"}`. `image` defaults to `WORKER_DEFAULT_IMAGE`, `size` to `DEFAULT_SIZE_CLASS`; an unknown size is a `400` listing the valid ones. Returns `202 Accepted` with the job and a `Location` header. |
 | `GET /work/{id}` | Job status (`Pending` → `Provisioning` (oke mode) → `Running` → `Succeeded`/`Failed`), pod name, node name and (oke mode) node OCID, exit code, logs, error, and an in-flight `message` such as `node …abcd is CREATING`, `Unschedulable: 0/3 nodes are available …` or `ErrImagePull: …`. |
 | `GET /sizes` | The configured size classes and the default. |
+
+Timestamps on a job: `createdAt`, `nodeReadyAt` (oke mode: node Ready),
+`startedAt` (pod created), `endedAt`.
 | `GET /work` | All jobs, newest first (logs omitted). |
 | `GET /healthz`, `GET /readyz` | Probes. |
 
@@ -661,6 +664,27 @@ controller log (`kubectl -n podspawner logs deploy/podspawner`), and
   namespace. A `ClusterRoleBinding` is the quick alternative, but it gives the
   controller pod rights in every namespace, including ones it should never
   touch.
+
+## Verification status
+
+Be aware of what has and has not been exercised:
+
+* **Unit-tested against fakes** (`make test`, race detector on): the pod
+  lifecycle against client-go's fake API server (success, failure, timeouts,
+  image-pull errors, external deletion, watch drops, API outages, sweeps),
+  the OKE provisioner against a fake Container Engine API (scale-up,
+  claiming oldest-first, coalesced updates under 409, node errors,
+  provisioning timeouts, idempotent deletes, sweeps, readiness checks), size
+  classes, the API, and configuration.
+* **Statically validated:** every rendered overlay and the add-on manifests
+  pass `kubeconform -strict` against Kubernetes 1.33 schemas (Karpenter CRDs
+  excepted); the controller cross-compiles for `linux/amd64` and
+  `linux/arm64`; OKE/OCI facts are sourced in "Sources consulted".
+* **Not yet run on a live cluster** by the author: neither the kind demo nor
+  any OKE mode. First real runs to do, in order: `make kind-up && make demo`
+  (pod lifecycle), then `NODE_MODE=none` on OKE with an existing labelled
+  pool, then `NODE_MODE=oke` after `make oke-preflight`. Measure the node
+  lead time (`nodeReadyAt - createdAt`) before relying on the defaults.
 
 ## Known limitations (it is a PoC)
 

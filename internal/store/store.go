@@ -52,13 +52,17 @@ type Job struct {
 	NodeID string `json:"nodeId,omitempty"`
 	// Message carries the latest scheduling / image-pull hint while the job
 	// is in flight, e.g. "Unschedulable: 0/3 nodes are available ...".
-	Message   string     `json:"message,omitempty"`
-	ExitCode  *int32     `json:"exitCode,omitempty"`
-	Logs      string     `json:"logs,omitempty"`
-	Error     string     `json:"error,omitempty"`
-	CreatedAt time.Time  `json:"createdAt"`
-	StartedAt *time.Time `json:"startedAt,omitempty"`
-	EndedAt   *time.Time `json:"endedAt,omitempty"`
+	Message   string    `json:"message,omitempty"`
+	ExitCode  *int32    `json:"exitCode,omitempty"`
+	Logs      string    `json:"logs,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	// NodeReadyAt is when the controller-provisioned node became Ready (oke
+	// mode); NodeReadyAt - CreatedAt is the node lead time to tune
+	// NODE_PROVISION_TIMEOUT with.
+	NodeReadyAt *time.Time `json:"nodeReadyAt,omitempty"`
+	StartedAt   *time.Time `json:"startedAt,omitempty"`
+	EndedAt     *time.Time `json:"endedAt,omitempty"`
 }
 
 // Store is a concurrency-safe map of jobs.

@@ -801,3 +801,30 @@ func TestRunSkipsProvisioningForClassWithoutPool(t *testing.T) {
 		t.Fatalf("provisioner must not be used for this class: %v %v", fp.provision, fp.released)
 	}
 }
+
+func TestKeepFailedPodsKeepsTheNodeToo(t *testing.T) {
+	h := newHarness(t, Config{KeepFailedPods: true})
+	fp := &fakeProvisioner{client: h.client, nodeName: "10.0.0.8"}
+	h.sp.cfg.Provisioner = fp
+	h.sp.cfg.Classes = bigClasses()
+	h.sp.cfg.DefaultClass = "default"
+
+	done := h.submit(t, "job23", store.WorkSpec{Image: "scanner"})
+	h.awaitWatch(t)
+	pod := h.workerPod(t, "job23")
+	h.finishPod(t, pod, corev1.PodFailed, 3)
+	waitDone(t, done)
+
+	if j, _ := h.store.Get("job23"); j.Status != store.StatusFailed || j.NodeReadyAt == nil {
+		t.Fatalf("got %+v", j)
+	}
+	if _, err := h.client.CoreV1().Pods(testNS).Get(context.Background(), pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("failed pod must be kept: %v", err)
+	}
+	fp.mu.Lock()
+	released := len(fp.released)
+	fp.mu.Unlock()
+	if released != 0 {
+		t.Fatalf("the kept pod's node must not be released, got %v", fp.released)
+	}
+}

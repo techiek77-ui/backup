@@ -23,6 +23,12 @@ Create one node pool per size class (`small`, `large`, ... as in
 
 Put the pool OCIDs into `SIZE_CLASSES` in `deployment-patch.yaml`.
 
+Check the pools before deploying (size 0, label, state, legacy placement):
+
+```bash
+SIZE_CLASSES='<the JSON from deployment-patch.yaml>' make oke-preflight
+```
+
 ## 2. IAM
 
 The controller calls `GetNodePool`, `UpdateNodePool` (size) and `DeleteNode`.
@@ -104,3 +110,28 @@ completion the node disappears from `kubectl get nodes`.
   first.
 * **Leaks:** nodes whose job is gone are removed by the sweep; a controller
   restart empties the managed pools first (job state is in memory).
+
+## Operations
+
+* **What the controller owns right now:** `kubectl get nodes -l workload=worker`
+  and `curl localhost:8080/work` (`nodeId`, `nodeName`, `nodeReadyAt`).
+  `nodeReadyAt - createdAt` is the node lead time; set
+  `NODE_PROVISION_TIMEOUT` to a multiple of the worst value you see.
+* **A node that should be gone:** wait one `SWEEP_INTERVAL` (default 5 min);
+  the sweep deletes every node in the managed pools that no active scan
+  owns. To force it, restart the controller (its start-up sweep empties the
+  pools). By hand:
+
+  ```bash
+  oci ce node-pool delete-node --node-pool-id <pool-ocid> --node-id <instance-ocid> --is-decrement-size true --override-eviction-grace-duration PT0M
+  ```
+
+* **`KEEP_FAILED_PODS=true`:** a failed scan keeps its pod **and its node**
+  until you delete the pod and the sweep removes the node afterwards (or
+  you delete the node as above). Debugging only; every kept node is billed.
+* **Pool size drifted** (size > nodes, or a node you did not expect): the
+  controller only ever changes size by `+N` on scale-up and by `-1` per node
+  it deletes; anything else was done outside it. Correct the size in the
+  Console or with `oci ce node-pool update --size`, then let the sweep run.
+* **Changing a class's shape:** edit the node pool (new nodes get the new
+  shape); no controller change is needed unless the pool OCID changes.

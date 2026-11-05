@@ -224,6 +224,7 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 	}
 	log := s.log.With("job", jobID)
 	_, class := s.ClassFor(job)
+	keep := false // set when a failed pod (and its node) is kept for inspection
 
 	pinned := ""
 	if s.cfg.Provisioner != nil && class.NodePoolID != "" {
@@ -238,14 +239,21 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 			s.fail(jobID, "", fmt.Errorf("provision node: %w", err))
 			return
 		}
+		ready := time.Now()
 		s.store.Update(jobID, func(j *store.Job) {
 			j.NodeID = node.ID
 			j.NodeName = node.Name
+			j.NodeReadyAt = &ready
 			j.Message = ""
 		})
 		log = log.With("node", node.Name)
-		// Registered before the pod cleanup below, so it runs after it.
+		// Registered before the pod cleanup below, so it runs after it. A
+		// failed pod kept for inspection keeps its node as well.
 		defer func() {
+			if keep {
+				log.Warn("keeping the node of the kept failed pod (KEEP_FAILED_PODS=true)")
+				return
+			}
 			if err := s.cfg.Provisioner.Release(context.Background(), node); err != nil {
 				log.Error("failed to delete node; the periodic sweep will retry", "err", err)
 			}
@@ -267,7 +275,6 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 		j.StartedAt = &now
 	})
 
-	keep := false
 	defer func() {
 		if !keep {
 			s.deletePod(created.Name, log)
@@ -670,9 +677,11 @@ func (s *Spawner) Sweep(ctx context.Context) (int, error) {
 		n++
 	}
 	if s.cfg.Provisioner != nil {
+		// A node stays owned while its job runs, and afterwards only when the
+		// failed pod on it is being kept for inspection.
 		active := func(jobID string) bool {
 			j, ok := s.store.Get(jobID)
-			return ok && !j.Status.Terminal()
+			return ok && (!j.Status.Terminal() || (s.cfg.KeepFailedPods && j.Status == store.StatusFailed))
 		}
 		deleted, err := s.cfg.Provisioner.Sweep(ctx, active)
 		n += deleted

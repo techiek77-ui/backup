@@ -2,7 +2,7 @@ IMAGE    ?= podspawner:dev
 PLATFORM ?= linux/amd64
 CLUSTER  ?= podspawner
 
-.PHONY: build test vet docker-build kind-up kind-down demo oke-push oke-deploy manifests
+.PHONY: build test vet docker-build kind-up kind-down demo oke-push oke-deploy oke-preflight manifests
 
 build:
 	CGO_ENABLED=0 go build -o bin/controller ./cmd/controller
@@ -33,6 +33,10 @@ kind-down:
 ##   make oke-deploy OVERLAY=oke-managed-nodes IMAGE=...   (controller-managed nodes)
 oke-push:
 	docker buildx build --platform $(PLATFORM) -t $(IMAGE) --push .
+
+## Check the node pools named in SIZE_CLASSES before deploying NODE_MODE=oke
+oke-preflight:
+	./hack/oke-preflight.sh
 
 OVERLAY ?= oke
 
