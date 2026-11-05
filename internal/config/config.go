@@ -125,10 +125,16 @@ func FromEnv() (Config, error) {
 	switch c.NodeMode {
 	case NodeModeNone:
 	case NodeModeOKE:
+		// Classes with a nodePoolId get a dedicated node; classes without one
+		// are scheduled normally (e.g. a virtual-node class next to VM classes).
+		withPool := 0
 		for _, name := range ClassNames(c.SizeClasses) {
-			if c.SizeClasses[name].NodePoolID == "" {
-				return c, fmt.Errorf("NODE_MODE=oke requires nodePoolId on every size class; %q has none", name)
+			if c.SizeClasses[name].NodePoolID != "" {
+				withPool++
 			}
+		}
+		if withPool == 0 {
+			return c, fmt.Errorf("NODE_MODE=oke requires nodePoolId on at least one size class")
 		}
 	default:
 		return c, fmt.Errorf("NODE_MODE must be %q or %q, got %q", NodeModeNone, NodeModeOKE, c.NodeMode)

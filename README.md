@@ -250,7 +250,9 @@ kubectl -n podspawner create secret docker-registry ocirsecret \
 ### 4. Deploy
 
 Either edit `images:` in `deploy/overlays/oke/kustomization.yaml` and run
-`kubectl apply -k deploy/overlays/oke`, or let the Makefile substitute the image:
+`kubectl apply -k deploy/overlays/oke`, or let the Makefile substitute the image
+(`OVERLAY=oke-managed-nodes` for controller-managed nodes; read that overlay's
+README for the node pools and IAM it needs):
 
 ```bash
 make oke-deploy IMAGE=<region-key>.ocir.io/<tenancy-namespace>/podspawner:0.1.0
@@ -314,7 +316,7 @@ one of the `workload=worker` nodes; afterwards it is gone.
 | `WORKER_IMAGE_PULL_TIMEOUT` | `3m` | Fail the job if its image is still unpullable (`ErrImagePull` / `ImagePullBackOff`) after this long; `InvalidImageName` fails at once. |
 | `API_RETRY_WINDOW` | `2m` | Retry transient API-server errors (5xx, timeouts, connection failures) for this long before failing a job. |
 | `SWEEP_INTERVAL` | `5m` | How often worker pods (and, in oke mode, nodes) that no in-flight job owns are reaped. |
-| `NODE_MODE` | `none` | `none`: an autoscaler or virtual-node pool provides nodes; `oke`: the controller grows/shrinks OKE node pools itself. |
+| `NODE_MODE` | `none` | `none`: an autoscaler or virtual-node pool provides nodes; `oke`: the controller grows/shrinks OKE node pools itself for classes that have a `nodePoolId` (classes without one schedule normally, so VM and virtual-node classes can coexist). |
 | `SIZE_CLASSES` | `{"default":{"cpu":"500m","memory":"256Mi"}}` | JSON: class → `cpu`, `memory` (pod requests = limits), optional `nodeSelector`, `tolerations`, `nodePoolId` (required in oke mode). |
 | `DEFAULT_SIZE_CLASS` | `default` | Class used when a request has no `size`. |
 | `ONE_POD_PER_NODE` | `true` | Required pod anti-affinity: never two worker pods on one node. |
@@ -334,10 +336,15 @@ sequenceDiagram
     participant C as Client
     participant K as Controller pod
     participant A as API server
+    participant O as OCI (oke mode)
     participant N as Labelled node
-    C->>K: POST /work {image, command}
+    C->>K: POST /work {image, command, size}
     K-->>C: 202 Accepted {id, status: Pending}
-    K->>A: create Pod work-id-xxxxx (nodeSelector, restartPolicy Never, activeDeadlineSeconds)
+    opt NODE_MODE=oke
+        K->>O: UpdateNodePool(size+1) on the class's pool
+        O-->>K: node CREATING → ACTIVE; Kubernetes Node Ready
+    end
+    K->>A: create Pod work-id-xxxxx (class resources, nodeSelector, anti-affinity, pinned to its node in oke mode)
     A->>N: scheduler binds to a workload=worker node; kubelet pulls image, runs it
     K->>A: GET + watch the pod (resumed if the watch drops)
     A-->>K: status events, copied to job.message (Unschedulable, ImagePullBackOff, ...)
@@ -345,6 +352,9 @@ sequenceDiagram
     A-->>K: terminal event
     K->>A: read logs, record exit code and node
     K->>A: delete Pod, confirm it is gone (force-delete if stuck Terminating)
+    opt NODE_MODE=oke
+        K->>O: DeleteNode(isDecrementSize=true, PT0M)
+    end
     C->>K: GET /work/{id}
     K-->>C: {status, nodeName, exitCode, logs, error}
 ```
@@ -352,11 +362,15 @@ sequenceDiagram
 1. **Accept.** `POST /work` validates the body, stores the job as `Pending` and
    returns `202` at once. A goroutine takes a slot from the `MAX_CONCURRENT`
    semaphore; requests beyond the cap wait in memory as `Pending`.
-2. **Create.** The goroutine creates one Pod `work-<id>-xxxxx` with
-   `restartPolicy: Never`, `activeDeadlineSeconds`, the node selector and
-   tolerations, the pull secrets, small resource requests/limits, labels
-   `app.kubernetes.io/name=podspawner-worker` and `podspawner.io/job-id=<id>`,
-   and no service-account token. Transient API errors are retried with
+2. **Create.** In `NODE_MODE=oke` the goroutine first brings up a node for
+   the job's size class (job `Provisioning`; see Node lifecycle modes). It
+   then creates one Pod `work-<id>-xxxxx` with `restartPolicy: Never`,
+   `activeDeadlineSeconds`, the class's resources (requests = limits), the
+   node selector and tolerations (global + class), a required anti-affinity
+   against other worker pods, the pull secrets, labels
+   `app.kubernetes.io/name=podspawner-worker`, `podspawner.io/job-id=<id>`
+   and `podspawner.io/size=<class>`, no service-account token, and in oke
+   mode a node affinity pinning it to its node. Transient API errors are retried with
    back-off for `API_RETRY_WINDOW`; a retry first looks for a pod already
    carrying the job's label and adopts it, so a lost response never produces
    a duplicate pod.
@@ -376,7 +390,8 @@ sequenceDiagram
    (exception: `KEEP_FAILED_PODS=true` keeps failed pods). The delete is
    graceful, then confirmed by polling for up to 45 s; a pod that is still
    `Terminating` after that, the signature of a node whose kubelet is gone,
-   is force-deleted (`gracePeriodSeconds: 0`).
+   is force-deleted (`gracePeriodSeconds: 0`). In oke mode the job's node is
+   deleted right after the pod.
 6. **Sweep.** On start-up and every `SWEEP_INTERVAL` the controller lists pods
    with the worker label and deletes any whose job is unknown or already
    finished (pods kept by `KEEP_FAILED_PODS` are left alone). Start-up
@@ -425,10 +440,13 @@ oke mode (and required there).
 
 ### Controller-managed nodes, step by step (`NODE_MODE=oke`)
 
-1. `POST /work` → job `Provisioning`. The controller reads the class's pool,
-   raises its size by one (size changes per pool are serialised), and
-   registers the job as waiting. `message`: `node pool scaled to 1; waiting
-   for a new node`.
+1. `POST /work` → job `Provisioning`. The controller registers the job as
+   waiting on the class's pool and raises the pool's size to cover every
+   waiting job. One size conversation per pool runs at a time, and jobs that
+   arrive while an update is being retried (OCI 409/429/5xx, e.g. while the
+   pool is `UPDATING`) are coalesced into the next update as `+N`, the way
+   the Cluster Autoscaler batches pending pods. `message`: `node pool scaled to 1; waiting for a new
+   node`.
 2. It polls the pool. A node that is `CREATING`/`ACTIVE`, not owned by another
    job, not being deleted, and not one that existed before this controller
    started is claimed by the **oldest waiting job**. `message`: `node …abcd
@@ -650,8 +668,10 @@ controller log (`kubectl -n podspawner logs deploy/podspawner`), and
 * Failed work is not retried automatically; the client resubmits.
 * In `NODE_MODE=oke` the managed node pools belong to the controller: any
   node in them that no active scan owns is deleted, and a controller restart
-  empties them. Concurrency per pool is serialised (one size change at a
-  time), which is fine for tens of scans, not thousands.
+  empties them. Size changes are one conversation per pool (concurrent scans
+  are coalesced into one update), sized for tens of concurrent scans per
+  class, not thousands. Pools must use node config details (placement
+  configs), which every pool created in recent years does.
 * A node per scan means every scan pays the node boot time (minutes on OKE);
   virtual nodes avoid it at the price of weaker isolation.
 * The request queue is unbounded and in memory.

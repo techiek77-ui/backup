@@ -742,6 +742,8 @@ func TestRunProvisionFailureFailsJobWithoutPod(t *testing.T) {
 	h := newHarness(t, Config{})
 	fp := &fakeProvisioner{client: h.client, fail: errors.New("node pool could not create the node: InternalError: Out of host capacity.")}
 	h.sp.cfg.Provisioner = fp
+	h.sp.cfg.Classes = bigClasses() // default class has a node pool, so provisioning applies
+	h.sp.cfg.DefaultClass = "default"
 
 	done := h.submit(t, "job21", store.WorkSpec{Image: "scanner"})
 	waitDone(t, done)
@@ -768,5 +770,34 @@ func TestSweepAlsoSweepsNodes(t *testing.T) {
 	}
 	if fp.sweeps != 1 {
 		t.Fatalf("node sweep not invoked (%d)", fp.sweeps)
+	}
+}
+
+func TestRunSkipsProvisioningForClassWithoutPool(t *testing.T) {
+	h := newHarness(t, Config{})
+	fp := &fakeProvisioner{client: h.client, nodeName: "10.0.0.9"}
+	h.sp.cfg.Provisioner = fp
+	h.sp.cfg.Classes = map[string]config.SizeClass{
+		"vm":         {CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), NodePoolID: "poolVM"},
+		"serverless": {CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), NodeSelector: map[string]string{"type": "virtual-node"}},
+	}
+	h.sp.cfg.DefaultClass = "vm"
+
+	done := h.submit(t, "job22", store.WorkSpec{Image: "scanner", Size: "serverless"})
+	h.awaitWatch(t)
+	pod := h.workerPod(t, "job22")
+	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
+		t.Fatal("a class without a node pool must not be pinned to a provisioned node")
+	}
+	if pod.Spec.NodeSelector["type"] != "virtual-node" {
+		t.Fatalf("class selector missing: %v", pod.Spec.NodeSelector)
+	}
+	h.finishPod(t, pod, corev1.PodSucceeded, 0)
+	waitDone(t, done)
+	if j, _ := h.store.Get("job22"); j.Status != store.StatusSucceeded || j.NodeID != "" {
+		t.Fatalf("got %+v", j)
+	}
+	if len(fp.provision) != 0 || len(fp.released) != 0 {
+		t.Fatalf("provisioner must not be used for this class: %v %v", fp.provision, fp.released)
 	}
 }

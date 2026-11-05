@@ -48,7 +48,9 @@ type fakeOKE struct {
 	noNode    map[string]bool                       // pool -> size grows but no node appears
 	failWith  map[string]*containerengine.NodeError // pool -> next created node gets this error
 	updateErr int                                   // UpdateNodePool calls to fail (500) first
+	busy      int                                   // UpdateNodePool calls to reject with 409 IncorrectState first
 	updates   int
+	okUpdates int
 	deletes   []containerengine.DeleteNodeRequest
 }
 
@@ -118,6 +120,11 @@ func (f *fakeOKE) UpdateNodePool(ctx context.Context, req containerengine.Update
 		f.updateErr--
 		return containerengine.UpdateNodePoolResponse{}, svcErr{500, "InternalError"}
 	}
+	if f.busy > 0 {
+		f.busy--
+		return containerengine.UpdateNodePoolResponse{}, svcErr{409, "IncorrectState: node pool is UPDATING"}
+	}
+	f.okUpdates++
 	poolID := *req.NodePoolId
 	np := f.pools[poolID]
 	want := *req.UpdateNodePoolDetails.NodeConfigDetails.Size
@@ -148,6 +155,9 @@ func (f *fakeOKE) DeleteNode(ctx context.Context, req containerengine.DeleteNode
 	np := f.pools[*req.NodePoolId]
 	for i := range np.Nodes {
 		if *np.Nodes[i].Id == *req.NodeId {
+			if np.Nodes[i].LifecycleState == containerengine.NodeLifecycleStateDeleting {
+				return containerengine.DeleteNodeResponse{}, svcErr{409, "Conflict: node is already being deleted"}
+			}
 			np.Nodes[i].LifecycleState = containerengine.NodeLifecycleStateDeleting
 			if req.IsDecrementSize != nil && *req.IsDecrementSize && *np.NodeConfigDetails.Size > 0 {
 				np.NodeConfigDetails.Size = common.Int(*np.NodeConfigDetails.Size - 1)
@@ -439,5 +449,70 @@ func TestSweepHandsNewNodeToWaiterInsteadOfDeleting(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("provision did not finish")
+	}
+}
+
+func TestConcurrentScaleUpsAreCoalescedWhilePoolBusy(t *testing.T) {
+	f, p := newHarness(t, OKEConfig{ProvisionTimeout: 10 * time.Second})
+	f.busy = 6 // OKE answers 409 while a pool is UPDATING; with exponential back-off six rejections span ~300ms
+
+	const n = 3
+	var wg sync.WaitGroup
+	ids := make(chan string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			node, err := p.Provision(context.Background(), fmt.Sprintf("job%d", i), classA, nil)
+			if err != nil {
+				t.Errorf("job%d: %v", i, err)
+				return
+			}
+			ids <- node.ID
+		}(i)
+	}
+	wg.Wait()
+	close(ids)
+	seen := map[string]bool{}
+	for id := range ids {
+		if seen[id] {
+			t.Fatalf("node %s handed to two jobs", id)
+		}
+		seen[id] = true
+	}
+	f.mu.Lock()
+	ok := f.okUpdates
+	f.mu.Unlock()
+	if len(seen) != n || f.size("poolA") != n {
+		t.Fatalf("got %d nodes, pool size %d, want %d", len(seen), f.size("poolA"), n)
+	}
+	if ok > 2 {
+		t.Fatalf("expected the three scale-ups to be coalesced into one or two size updates, got %d", ok)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.unaccepted["poolA"] != 0 || len(p.waiters["poolA"]) != 0 {
+		t.Fatalf("bookkeeping: unaccepted=%d waiters=%d", p.unaccepted["poolA"], len(p.waiters["poolA"]))
+	}
+}
+
+func TestReleaseIsIdempotentWhileNodeIsDeleting(t *testing.T) {
+	f, p := newHarness(t, OKEConfig{APIRetryWindow: 5 * time.Second})
+	node, err := p.Provision(context.Background(), "job1", classA, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Release(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := p.Release(context.Background(), node); err != nil { // OKE: 409, node already DELETING
+		t.Fatalf("second release must succeed, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("second release must not sit in the retry loop, took %s", time.Since(start))
+	}
+	if d := f.deleted(); len(d) != 2 {
+		t.Fatalf("deletes = %d, want 2", len(d))
 	}
 }

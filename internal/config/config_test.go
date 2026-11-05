@@ -138,8 +138,12 @@ func TestFromEnvNodeModes(t *testing.T) {
 	}
 
 	t.Setenv("NODE_MODE", "oke")
-	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), `"large" has none`) {
-		t.Fatalf("oke mode must require nodePoolId on every class, got %v", err)
+	if c, err := FromEnv(); err != nil || c.SizeClasses["large"].NodePoolID != "" {
+		t.Fatalf("oke mode allows classes without a pool (scheduled normally), got %v", err)
+	}
+	t.Setenv("SIZE_CLASSES", `{"small":{"cpu":"1","memory":"2Gi"},"large":{"cpu":"4","memory":"8Gi"}}`)
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "at least one size class") {
+		t.Fatalf("oke mode must require at least one class with a pool, got %v", err)
 	}
 	t.Setenv("SIZE_CLASSES", `{"small":{"cpu":"1","memory":"2Gi","nodePoolId":"ocid1.nodepool.oc1..a"}}`)
 	t.Setenv("OCI_AUTH_MODE", "instance-principal")

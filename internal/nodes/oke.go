@@ -50,17 +50,20 @@ type OKE struct {
 	cfg  OKEConfig
 	log  *slog.Logger
 
-	mu      sync.Mutex
-	claimed map[string]*Node     // node ID -> owning job
-	doomed  map[string]struct{}  // node IDs we asked OKE to delete
-	foreign map[string]struct{}  // node IDs present when a pool was first seen: never ours
-	seen    map[string]bool      // pool ID -> first observation done
-	waiters map[string][]*waiter // pool ID -> jobs waiting for a node, oldest first
+	mu         sync.Mutex
+	claimed    map[string]*Node       // node ID -> owning job
+	doomed     map[string]struct{}    // node IDs we asked OKE to delete
+	foreign    map[string]struct{}    // node IDs present when a pool was first seen: never ours
+	seen       map[string]bool        // pool ID -> first observation done
+	scaleMu    map[string]*sync.Mutex // pool ID -> one size conversation with OCI at a time
+	unaccepted map[string]int         // pool ID -> waiters not yet covered by an accepted size update
+	waiters    map[string][]*waiter   // pool ID -> jobs waiting for a node, oldest first
 }
 
 type waiter struct {
-	jobID string
-	ch    chan *Node
+	jobID    string
+	ch       chan *Node
+	accepted bool // a size update covering this waiter was accepted by OCI
 }
 
 func NewOKE(api OKEAPI, kube kubernetes.Interface, cfg OKEConfig, log *slog.Logger) *OKE {
@@ -83,6 +86,7 @@ func NewOKE(api OKEAPI, kube kubernetes.Interface, cfg OKEConfig, log *slog.Logg
 		api: api, kube: kube, cfg: cfg, log: log,
 		claimed: map[string]*Node{}, doomed: map[string]struct{}{}, foreign: map[string]struct{}{},
 		seen: map[string]bool{}, waiters: map[string][]*waiter{},
+		scaleMu: map[string]*sync.Mutex{}, unaccepted: map[string]int{},
 	}
 }
 
@@ -107,12 +111,22 @@ func (p *OKE) Provision(ctx context.Context, jobID string, class config.SizeClas
 	log := p.log.With("job", jobID, "pool", shortID(poolID))
 
 	w := &waiter{jobID: jobID, ch: make(chan *Node, 1)}
-	size, err := p.scaleUp(ctx, poolID, w)
+	p.mu.Lock()
+	p.waiters[poolID] = append(p.waiters[poolID], w)
+	p.unaccepted[poolID]++
+	p.mu.Unlock()
+
+	size, err := p.ensureScaled(ctx, poolID)
 	if err != nil {
+		p.dropWaiter(poolID, w)
 		return nil, fmt.Errorf("scale up node pool: %w", err)
 	}
-	log.Info("node pool scaled up", "size", size)
-	report(fmt.Sprintf("node pool scaled to %d; waiting for a new node", size))
+	if size > 0 {
+		log.Info("node pool scaled up", "size", size)
+		report(fmt.Sprintf("node pool scaled to %d; waiting for a new node", size))
+	} else {
+		report("waiting for a new node (covered by an earlier scale-up)")
+	}
 
 	node, err := p.awaitClaim(ctx, poolID, w, report)
 	if err != nil {
@@ -134,34 +148,90 @@ func (p *OKE) Provision(ctx context.Context, jobID string, class config.SizeClas
 	return node, nil
 }
 
-// scaleUp reads the pool's desired size and raises it by one. Size changes
-// and claims are serialised through p.mu so concurrent jobs never read a
-// stale size or claim the same node.
-func (p *OKE) scaleUp(ctx context.Context, poolID string, w *waiter) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// ensureScaled raises the pool's desired size to cover every waiter that no
+// accepted size update covers yet. One conversation per pool at a time: jobs
+// that arrive while the pool is busy (OKE answers 409 while a node pool is
+// UPDATING) are coalesced into the next update, exactly like the Cluster
+// Autoscaler batches pending pods, instead of each waiting its turn for a
+// multi-minute work request. Returns the size requested, or 0 when an
+// earlier update already covered this caller.
+func (p *OKE) ensureScaled(ctx context.Context, poolID string) (int, error) {
+	lock := p.poolLock(poolID)
+	lock.Lock()
+	defer lock.Unlock()
 
-	np, err := p.getPool(ctx, poolID)
-	if err != nil {
-		return 0, err
-	}
-	p.observeLocked(poolID, np)
-	size := desiredSize(np) + 1
-	err = p.retry(ctx, "UpdateNodePool", func() error {
-		_, err := p.api.UpdateNodePool(ctx, containerengine.UpdateNodePoolRequest{
+	delay := p.cfg.retryBase
+	last := 0
+	for attempt := 1; ; attempt++ {
+		p.mu.Lock()
+		n := p.unaccepted[poolID]
+		p.mu.Unlock()
+		if n == 0 {
+			return last, nil
+		}
+		np, err := p.getPool(ctx, poolID)
+		if err != nil {
+			return 0, err
+		}
+		p.mu.Lock()
+		p.observeLocked(poolID, np)
+		p.mu.Unlock()
+
+		size := desiredSize(np) + n
+		_, err = p.api.UpdateNodePool(ctx, containerengine.UpdateNodePoolRequest{
 			NodePoolId: common.String(poolID),
 			UpdateNodePoolDetails: containerengine.UpdateNodePoolDetails{
 				NodeConfigDetails: &containerengine.UpdateNodePoolNodeConfigDetails{Size: common.Int(size)},
 			},
 			RequestMetadata: requestMetadata(),
 		})
-		return err
-	})
-	if err != nil {
-		return 0, err
+		if err == nil {
+			p.mu.Lock()
+			accepted := 0
+			for _, w := range p.waiters[poolID] {
+				if accepted == n {
+					break
+				}
+				if !w.accepted {
+					w.accepted = true
+					accepted++
+				}
+			}
+			if p.unaccepted[poolID] -= accepted; p.unaccepted[poolID] < 0 {
+				p.unaccepted[poolID] = 0
+			}
+			p.mu.Unlock()
+			last = size
+			delay = p.cfg.retryBase
+			continue // newcomers may have registered meanwhile
+		}
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if !isTransient(err) {
+			return 0, fmt.Errorf("UpdateNodePool: %w", err)
+		}
+		p.log.Warn("node pool busy or OCI error; retrying size update", "pool", shortID(poolID), "attempt", attempt, "in", delay, "err", err)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay *= 2; delay > 15*time.Second {
+			delay = 15 * time.Second
+		}
 	}
-	p.waiters[poolID] = append(p.waiters[poolID], w)
-	return size, nil
+}
+
+func (p *OKE) poolLock(poolID string) *sync.Mutex {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m, ok := p.scaleMu[poolID]
+	if !ok {
+		m = &sync.Mutex{}
+		p.scaleMu[poolID] = m
+	}
+	return m
 }
 
 // awaitClaim polls the pool until a node is assigned to this waiter.
@@ -214,6 +284,9 @@ func (p *OKE) dropWaiter(poolID string, w *waiter) {
 	for i, x := range ws {
 		if x == w {
 			p.waiters[poolID] = append(ws[:i], ws[i+1:]...)
+			if !w.accepted && p.unaccepted[poolID] > 0 {
+				p.unaccepted[poolID]--
+			}
 			return
 		}
 	}
@@ -367,8 +440,11 @@ func (p *OKE) Release(ctx context.Context, n *Node) error {
 			IsForceDeletionAfterOverrideGraceDuration: common.Bool(true),
 			RequestMetadata: requestMetadata(),
 		})
-		if isNotFound(err) {
+		switch {
+		case err == nil, isNotFound(err):
 			return nil
+		case isConflict(err) && p.goneOrDeleting(ctx, n):
+			return nil // OKE answers 409 when the node is already being deleted
 		}
 		return err
 	})
@@ -490,6 +566,26 @@ func isTransient(err error) bool {
 func isNotFound(err error) bool {
 	se, ok := common.IsServiceError(err)
 	return ok && se.GetHTTPStatusCode() == 404
+}
+
+func isConflict(err error) bool {
+	se, ok := common.IsServiceError(err)
+	return ok && se.GetHTTPStatusCode() == 409
+}
+
+// goneOrDeleting reports whether the node is absent from its pool or already
+// on its way out (DELETING/DELETED), using a single pool read.
+func (p *OKE) goneOrDeleting(ctx context.Context, n *Node) bool {
+	resp, err := p.api.GetNodePool(ctx, containerengine.GetNodePoolRequest{NodePoolId: common.String(n.PoolID), RequestMetadata: requestMetadata()})
+	if err != nil {
+		return false
+	}
+	for _, node := range resp.NodePool.Nodes {
+		if node.Id != nil && *node.Id == n.ID {
+			return node.LifecycleState == containerengine.NodeLifecycleStateDeleting || node.LifecycleState == containerengine.NodeLifecycleStateDeleted
+		}
+	}
+	return true
 }
 
 // requestMetadata enables the SDK's own retry policy (409 IncorrectState,

@@ -226,7 +226,7 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 	_, class := s.ClassFor(job)
 
 	pinned := ""
-	if s.cfg.Provisioner != nil {
+	if s.cfg.Provisioner != nil && class.NodePoolID != "" {
 		s.store.Update(jobID, func(j *store.Job) {
 			j.Status = store.StatusProvisioning
 			j.Message = "bringing up a node"

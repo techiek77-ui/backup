@@ -23,7 +23,8 @@ for _ in $(seq 1 40); do
 done
 curl -sf "$BASE/healthz" >/dev/null || { echo "port-forward to svc/podspawner failed" >&2; exit 1; }
 
-echo "==> Worker pods before:"
+echo "==> Worker nodes and pods before:"
+kubectl get nodes -l workload=worker -o wide 2>/dev/null || true
 kubectl -n "$NS" get pods -l app.kubernetes.io/name=podspawner-worker -o wide 2>/dev/null || true
 
 echo
@@ -35,20 +36,24 @@ EOF
 echo
 echo "==> job id: $ID"
 
-sleep 3
 echo
-echo "==> Worker pod while running (note the NODE column):"
-kubectl -n "$NS" get pods -l app.kubernetes.io/name=podspawner-worker -o wide
-
-echo
-echo "==> Polling GET /work/$ID"
+echo "==> Polling GET /work/$ID (Provisioning appears only in NODE_MODE=oke)"
+SHOWN=0
 while :; do
   JOB=$(curl -sf "$BASE/work/$ID")
   STATUS=$(jq -r .status <<<"$JOB")
   MSG=$(jq -r '.message // empty' <<<"$JOB")
   printf '   status=%s %s\n' "$STATUS" "${MSG:+($MSG)}"
+  if [ "$STATUS" = Running ] && [ "$SHOWN" = 0 ]; then
+    SHOWN=1
+    sleep 2
+    echo
+    echo "==> Worker pod while running (note the NODE column):"
+    kubectl -n "$NS" get pods -l app.kubernetes.io/name=podspawner-worker -o wide
+    echo
+  fi
   case "$STATUS" in Succeeded|Failed) break ;; esac
-  sleep 2
+  sleep 3
 done
 
 echo
@@ -58,3 +63,6 @@ jq . <<<"$JOB"
 echo
 echo "==> Worker pods after (should be empty):"
 kubectl -n "$NS" get pods -l app.kubernetes.io/name=podspawner-worker -o wide 2>/dev/null || true
+echo
+echo "==> Worker nodes after (NODE_MODE=oke: the scan's node is being deleted):"
+kubectl get nodes -l workload=worker -o wide 2>/dev/null || true
