@@ -1,0 +1,15 @@
+# Size classes for NODE_MODE=oke: one entry per class.
+#   cpu / memory  what the worker pod requests (= its limits)
+#   nodePoolId    the OKE node pool the controller grows by one for a scan of
+#                 this class: size 0, shape for the class, initial node label
+#                 workload=worker, no autoscaler, used by nothing else
+# Classes without nodePoolId are scheduled normally (e.g. a virtual-node
+# class); at least one class must have one.
+small:
+  cpu: 1
+  memory: 2Gi
+  nodePoolId: ocid1.nodepool.oc1.REGION.SMALL_POOL_OCID
+large:
+  cpu: 8
+  memory: 32Gi
+  nodePoolId: ocid1.nodepool.oc1.REGION.LARGE_POOL_OCID

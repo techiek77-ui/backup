@@ -1,14 +1,17 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/yaml"
 )
 
 // SizeClass describes one request size: the resources a worker pod gets
@@ -26,10 +29,28 @@ type SizeClass struct {
 	NodePoolID string
 }
 
+// flexString accepts a JSON string or a bare number, so YAML like `cpu: 1`
+// works as well as `cpu: "1"`.
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*f = flexString(s)
+		return nil
+	}
+	*f = flexString(b)
+	return nil
+}
+
 // sizeClassJSON is the on-the-wire shape of SIZE_CLASSES entries.
 type sizeClassJSON struct {
-	CPU          string              `json:"cpu"`
-	Memory       string              `json:"memory"`
+	CPU          flexString          `json:"cpu"`
+	Memory       flexString          `json:"memory"`
 	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
 	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
 	NodePoolID   string              `json:"nodePoolId,omitempty"`
@@ -66,11 +87,11 @@ func ParseSizeClasses(raw string) (map[string]SizeClass, error) {
 		if errs := validation.IsValidLabelValue(name); name == "" || len(errs) > 0 {
 			return nil, fmt.Errorf("SIZE_CLASSES: class name %q is not a valid label value (%s)", name, strings.Join(errs, "; "))
 		}
-		cpu, err := resource.ParseQuantity(c.CPU)
+		cpu, err := resource.ParseQuantity(string(c.CPU))
 		if err != nil || cpu.Sign() <= 0 {
 			return nil, fmt.Errorf("SIZE_CLASSES[%s].cpu must be a positive quantity such as \"500m\" or \"2\"", name)
 		}
-		mem, err := resource.ParseQuantity(c.Memory)
+		mem, err := resource.ParseQuantity(string(c.Memory))
 		if err != nil || mem.Sign() <= 0 {
 			return nil, fmt.Errorf("SIZE_CLASSES[%s].memory must be a positive quantity such as \"256Mi\" or \"4Gi\"", name)
 		}
@@ -88,6 +109,27 @@ func ParseSizeClasses(raw string) (map[string]SizeClass, error) {
 		}
 	}
 	return out, nil
+}
+
+// LoadSizeClasses reads SIZE_CLASSES_FILE (YAML or JSON, same structure as
+// SIZE_CLASSES) when set, otherwise the SIZE_CLASSES environment value.
+func LoadSizeClasses(file, env string) (map[string]SizeClass, error) {
+	if file = strings.TrimSpace(file); file == "" {
+		return ParseSizeClasses(env)
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("SIZE_CLASSES_FILE: %w", err)
+	}
+	j, err := yaml.YAMLToJSON(b)
+	if err != nil {
+		return nil, fmt.Errorf("SIZE_CLASSES_FILE %s: %w", file, err)
+	}
+	classes, err := ParseSizeClasses(string(j))
+	if err != nil {
+		return nil, fmt.Errorf("SIZE_CLASSES_FILE %s: %w", file, err)
+	}
+	return classes, nil
 }
 
 // ClassNames returns the class names sorted, for messages and the API.

@@ -129,7 +129,7 @@ func FromEnv() (Config, error) {
 	if c.LogTailLines < 0 {
 		return c, fmt.Errorf("WORKER_LOG_TAIL_LINES must be >= 0")
 	}
-	if c.SizeClasses, err = ParseSizeClasses(os.Getenv("SIZE_CLASSES")); err != nil {
+	if c.SizeClasses, err = LoadSizeClasses(os.Getenv("SIZE_CLASSES_FILE"), os.Getenv("SIZE_CLASSES")); err != nil {
 		return c, err
 	}
 	if _, ok := c.SizeClasses[c.DefaultSizeClass]; !ok {

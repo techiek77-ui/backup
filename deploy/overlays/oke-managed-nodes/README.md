@@ -21,12 +21,12 @@ Create one node pool per size class (`small`, `large`, ... as in
 * nothing else scheduled on it: the controller deletes every node in these
   pools that no active scan owns (on start-up and every `SWEEP_INTERVAL`).
 
-Put the pool OCIDs into `SIZE_CLASSES` in `deployment-patch.yaml`.
-
-Check the pools before deploying (size 0, label, state, legacy placement):
+Put the pool OCIDs into `size-classes.yaml` next to this file (it is mounted
+into the controller through a ConfigMap; `cpu`/`memory` are the worker pod's
+requests). Then check the pools (size 0, label, state, legacy placement):
 
 ```bash
-SIZE_CLASSES='<the JSON from deployment-patch.yaml>' make oke-preflight
+make oke-preflight
 ```
 
 ## 2. IAM
@@ -68,7 +68,7 @@ outside the cluster with your CLI config, `OCI_AUTH_MODE=config-file`,
 
 ```bash
 NODE_MODE=oke OCI_AUTH_MODE=config-file POD_NAMESPACE=podspawner \
-SIZE_CLASSES='{"small":{"cpu":"1","memory":"2Gi","nodePoolId":"ocid1.nodepool.oc1..."}}' DEFAULT_SIZE_CLASS=small \
+SIZE_CLASSES_FILE=deploy/overlays/oke-managed-nodes/size-classes.yaml DEFAULT_SIZE_CLASS=small \
 go run ./cmd/controller
 ```
 

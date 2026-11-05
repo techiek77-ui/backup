@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -185,3 +187,53 @@ func TestFromEnvNodeModes(t *testing.T) {
 // Quantity's String has a pointer receiver; map values are not addressable.
 func cpuOf(c SizeClass) string { return c.CPU.String() }
 func memOf(c SizeClass) string { return c.Memory.String() }
+
+func TestSizeClassesFromYAMLFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "size-classes.yaml")
+	if err := os.WriteFile(file, []byte(`# comments are fine
+small:
+  cpu: 1          # bare numbers work
+  memory: 2Gi
+  nodePoolId: ocid1.nodepool.oc1..small
+large:
+  cpu: "8"
+  memory: 32Gi
+  nodeSelector:
+    size: large
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SIZE_CLASSES_FILE", file)
+	t.Setenv("SIZE_CLASSES", `{"ignored":{"cpu":"1","memory":"1Gi"}}`) // file wins
+	t.Setenv("DEFAULT_SIZE_CLASS", "small")
+	c, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ClassNames(c.SizeClasses); !reflect.DeepEqual(got, []string{"large", "small"}) {
+		t.Fatalf("names = %v", got)
+	}
+	if cpuOf(c.SizeClasses["small"]) != "1" || memOf(c.SizeClasses["large"]) != "32Gi" || c.SizeClasses["large"].NodeSelector["size"] != "large" {
+		t.Errorf("classes = %+v", c.SizeClasses)
+	}
+
+	t.Setenv("SIZE_CLASSES_FILE", filepath.Join(dir, "missing.yaml"))
+	if _, err := FromEnv(); err == nil {
+		t.Error("missing file must error")
+	}
+	if err := os.WriteFile(file, []byte("small: [not, a, class]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SIZE_CLASSES_FILE", file)
+	if _, err := FromEnv(); err == nil {
+		t.Error("malformed file must error")
+	}
+
+	// bare numbers are accepted in the env JSON form too
+	t.Setenv("SIZE_CLASSES_FILE", "")
+	t.Setenv("SIZE_CLASSES", `{"small":{"cpu":2,"memory":"4Gi"}}`)
+	if c, err := FromEnv(); err != nil || cpuOf(c.SizeClasses["small"]) != "2" {
+		t.Fatalf("numeric cpu in JSON: %v %v", err, c.SizeClasses)
+	}
+}

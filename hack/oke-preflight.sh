@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
-# Pre-flight for NODE_MODE=oke: checks every node pool referenced by
-# SIZE_CLASSES with the OCI CLI and kubectl before the controller is deployed.
+# Pre-flight for NODE_MODE=oke: checks every node pool referenced by the size
+# classes with the OCI CLI and kubectl before the controller is deployed.
 #
-#   SIZE_CLASSES='{"small":{"cpu":"1","memory":"2Gi","nodePoolId":"ocid1.nodepool..."}}' ./hack/oke-preflight.sh
+#   ./hack/oke-preflight.sh                       # reads deploy/overlays/oke-managed-nodes/size-classes.yaml
+#   SIZE_CLASSES_FILE=path/to/classes.yaml ./hack/oke-preflight.sh
+#   SIZE_CLASSES='{"small":{...}}' ./hack/oke-preflight.sh
 #
-# Needs: oci (configured), kubectl (pointing at the cluster), jq.
+# Needs: oci (configured), kubectl (pointing at the cluster), jq; for a YAML
+# file also yq or python3 with PyYAML.
 set -euo pipefail
 
 for tool in oci kubectl jq; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
-: "${SIZE_CLASSES:?set SIZE_CLASSES to the JSON you will give the controller}"
+if [ -z "${SIZE_CLASSES:-}" ]; then
+  FILE="${SIZE_CLASSES_FILE:-$(dirname "${BASH_SOURCE[0]}")/../deploy/overlays/oke-managed-nodes/size-classes.yaml}"
+  [ -f "$FILE" ] || { echo "no SIZE_CLASSES set and $FILE not found" >&2; exit 1; }
+  if command -v yq >/dev/null; then
+    SIZE_CLASSES=$(yq -o=json '.' "$FILE")
+  elif python3 -c 'import yaml' 2>/dev/null; then
+    SIZE_CLASSES=$(python3 -c 'import json,sys,yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))' "$FILE")
+  else
+    echo "need yq or python3+PyYAML to read $FILE; or pass SIZE_CLASSES as JSON" >&2; exit 1
+  fi
+  echo "==> size classes from $FILE"
+fi
 LABEL_KEY="${LABEL_KEY:-workload}"
 LABEL_VALUE="${LABEL_VALUE:-worker}"
 rc=0

@@ -25,7 +25,9 @@ spec:
 
             # Nodes come from an autoscaler here (NODE_MODE=none). With the
             # Cluster Autoscaler or Karpenter manifests in deploy/addons, map
-            # each size class to its pool by label; one pool per class:
+            # each size class to its pool by label, one pool per class, either
+            # inline or from a YAML file mounted like the oke-managed-nodes
+            # overlay does (SIZE_CLASSES_FILE):
             # - name: SIZE_CLASSES
             #   value: '{"small":{"cpu":"1","memory":"2Gi","nodeSelector":{"size":"small"}},"large":{"cpu":"8","memory":"32Gi","nodeSelector":{"size":"large"}}}'
             # - name: DEFAULT_SIZE_CLASS

@@ -14,6 +14,29 @@ node pools itself, the Cluster Autoscaler, Karpenter for OCI, or OKE virtual
 nodes. Requests carry a **size class** (`small`, `large`, …) that decides the
 pod's resources and which pool/shape serves it.
 
+## Start here
+
+The shortest path to a node that exists only while a scan runs
+(controller-managed nodes on OKE); the other three modes are in
+[Node lifecycle modes](#node-lifecycle-modes).
+
+1. Local sanity check of the pod lifecycle (Docker, kind, kubectl, jq):
+   `make kind-up && make demo`
+2. On OKE, create one node pool per size class: size 0, the class's shape,
+   an OKE image, initial node label `workload=worker`, no autoscaler.
+3. Fill in `deploy/overlays/oke-managed-nodes/size-classes.yaml` (pool
+   OCIDs, cpu/memory per class) and the region in its `deployment-patch.yaml`;
+   grant the IAM policy from that overlay's README.
+4. `make oke-preflight` — must print no `WARN`.
+5. Push the image and deploy:
+   `make oke-push oke-deploy OVERLAY=oke-managed-nodes IMAGE=<region-key>.ocir.io/<tenancy-namespace>/podspawner:0.1.0`
+6. `SIZE=small ./hack/demo.sh` and watch `kubectl get nodes -l workload=worker`
+   grow by one and shrink again.
+
+Everything you will set is in the first table under
+[Configuration](#configuration-environment-variables-on-the-controller);
+the rest are tuning knobs.
+
 ```
  client ──POST /work──▶ ┌──────────────────────────┐
                         │ controller (Deployment)  │── create Pod ──▶ ┌────────────────────┐
@@ -308,30 +331,39 @@ one of the `workload=worker` nodes; afterwards it is gone.
 
 ## Configuration (environment variables on the controller)
 
+### Settings you will set
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `POD_NAMESPACE` | `podspawner` | Namespace for worker pods (injected via downward API). |
-| `WORKER_NODE_SELECTOR` | `workload=worker` | `k=v,k2=v2` node labels worker pods must match. Empty = any node. |
-| `WORKER_TOLERATIONS` | – | JSON array of tolerations for worker pods. |
-| `WORKER_IMAGE_PULL_SECRET` | – | Comma-separated secret names for worker image pulls. |
-| `WORKER_SERVICE_ACCOUNT` | `podspawner-worker` | SA for worker pods (no permissions, token not mounted). |
-| `WORKER_DEFAULT_IMAGE` | `busybox:1.36` | Used when a request omits `image`. |
+| `NODE_MODE` | `none` | `none`: an autoscaler or virtual-node pool provides nodes; `oke`: the controller grows/shrinks OKE node pools itself for classes that have a `nodePoolId` (classes without one schedule normally, so VM and virtual-node classes can coexist). |
+| `SIZE_CLASSES_FILE` | – | Path to a YAML or JSON file of size classes (the managed-nodes overlay mounts `size-classes.yaml` through a ConfigMap). Takes precedence over `SIZE_CLASSES`. |
+| `SIZE_CLASSES` | one `default` class, 500m / 256Mi | Inline JSON alternative: class → `cpu`, `memory` (pod requests = limits), optional `nodeSelector`, `tolerations`, `nodePoolId` (oke mode). |
+| `DEFAULT_SIZE_CLASS` | `default` | Class used when a request has no `size`. |
+| `WORKER_NODE_SELECTOR` | `workload=worker` | `k=v,k2=v2` node labels worker pods must match; classes can add to it. Empty = any node. |
 | `WORKER_DEFAULT_TIMEOUT` | `24h` | Pod `activeDeadlineSeconds` when the request omits `timeoutSeconds`. Scans are long and variable: send `timeoutSeconds` per request. |
 | `WORKER_MAX_TIMEOUT` | `24h` | Cap for a request's `timeoutSeconds` (`400` above it); the default must not exceed it. |
-| `WORKER_SCHEDULE_TIMEOUT` | `2m` | Fail the job if the pod is still unscheduled after this long. |
-| `WORKER_IMAGE_PULL_TIMEOUT` | `3m` | Fail the job if its image is still unpullable (`ErrImagePull` / `ImagePullBackOff`) after this long; `InvalidImageName` fails at once. |
-| `API_RETRY_WINDOW` | `2m` | Retry transient API-server errors (5xx, timeouts, connection failures) for this long before failing a job. |
-| `SWEEP_INTERVAL` | `5m` | How often worker pods (and, in oke mode, nodes) that no in-flight job owns are reaped. |
-| `NODE_MODE` | `none` | `none`: an autoscaler or virtual-node pool provides nodes; `oke`: the controller grows/shrinks OKE node pools itself for classes that have a `nodePoolId` (classes without one schedule normally, so VM and virtual-node classes can coexist). |
-| `SIZE_CLASSES` | `{"default":{"cpu":"500m","memory":"256Mi"}}` | JSON: class → `cpu`, `memory` (pod requests = limits), optional `nodeSelector`, `tolerations`, `nodePoolId` (required in oke mode). |
-| `DEFAULT_SIZE_CLASS` | `default` | Class used when a request has no `size`. |
-| `ONE_POD_PER_NODE` | `true` | Required pod anti-affinity: never two worker pods on one node. |
+| `MAX_CONCURRENT` | `10` | Simultaneous scans (each holds a node in oke mode); extra requests queue as `Pending`. |
+| `OCI_AUTH_MODE` | `auto` | oke mode: `workload-identity`, `instance-principal`, `config-file`, or `auto` (workload identity in-cluster, config file outside). |
+| `OCI_RESOURCE_PRINCIPAL_REGION` | – | Required with workload identity, e.g. `eu-frankfurt-1` (`OCI_REGION` is accepted too). |
+| `WORKER_IMAGE_PULL_SECRET` | – | Comma-separated secret names for worker image pulls (private OCIR). |
+| `WORKER_TOLERATIONS` | – | JSON array of tolerations for worker pods (tainted dedicated pool). |
+| `WORKER_DEFAULT_IMAGE` | `busybox:1.36` | Used when a request omits `image`. |
+| `POD_NAMESPACE` | `podspawner` | Namespace for worker pods; injected by the Deployment via the downward API. |
+
+### Tuning knobs (defaults are fine)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WORKER_SCHEDULE_TIMEOUT` | `2m` | Fail the job if the pod is still unscheduled after this long. Raise it (e.g. `12m`) when an autoscaler has to create the node first. |
+| `WORKER_IMAGE_PULL_TIMEOUT` | `3m` | Fail the job if its image is still unpullable after this long; `InvalidImageName` fails at once. |
 | `NODE_PROVISION_TIMEOUT` | `15m` | oke mode: scale-up + boot + join deadline per job. |
-| `OCI_AUTH_MODE` | `auto` | oke mode: `workload-identity`, `instance-principal`, `config-file`, or `auto` (workload identity in-cluster, config file outside). Workload identity also needs `OCI_RESOURCE_PRINCIPAL_REGION`. |
-| `MAX_CONCURRENT` | `10` | Max simultaneous worker pods; extra requests queue as `Pending`. |
+| `ONE_POD_PER_NODE` | `true` | Required pod anti-affinity: never two worker pods on one node. |
+| `API_RETRY_WINDOW` | `2m` | Retry transient Kubernetes/OCI API errors for this long before failing a job. |
+| `SWEEP_INTERVAL` | `5m` | How often worker pods (and, in oke mode, nodes) that no in-flight job owns are reaped. |
+| `KEEP_FAILED_PODS` | `false` | Keep failed pods (and in oke mode their nodes) for debugging. |
 | `MAX_LOG_BYTES` | `262144` | Log bytes kept per job. |
-| `WORKER_LOG_TAIL_LINES` | `1000` | Keep the last N lines of the worker's log (the summary at the end of a long scan) rather than the first bytes; `0` = from the start. |
-| `KEEP_FAILED_PODS` | `false` | Leave failed pods in place for debugging. |
+| `WORKER_LOG_TAIL_LINES` | `1000` | Keep the last N lines of the worker's log rather than the first bytes; `0` = from the start. |
+| `WORKER_SERVICE_ACCOUNT` | `podspawner-worker` | SA for worker pods (no permissions, token not mounted). |
 | `PORT` | `8080` | HTTP port. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
@@ -442,10 +474,25 @@ SIZE_CLASSES='{"small":{"cpu":"1","memory":"2Gi","nodeSelector":{"size":"small"}
 DEFAULT_SIZE_CLASS=small
 ```
 
+The same structure as YAML in a file (`SIZE_CLASSES_FILE`) is what the
+managed-nodes overlay uses, mounted from a ConfigMap, so nobody edits JSON
+inside a YAML string:
+
+```yaml
+small:
+  cpu: 1
+  memory: 2Gi
+  nodePoolId: ocid1.nodepool.oc1...
+large:
+  cpu: 8
+  memory: 32Gi
+  nodePoolId: ocid1.nodepool.oc1...
+```
+
 A request names one with `"size":"large"`. `GET /sizes` lists them. Class
 `nodeSelector`/`tolerations` are merged over the global
 `WORKER_NODE_SELECTOR`/`WORKER_TOLERATIONS`; `nodePoolId` is used only in
-oke mode (and required there).
+oke mode (at least one class needs it there).
 
 ### Controller-managed nodes, step by step (`NODE_MODE=oke`)
 
@@ -491,12 +538,12 @@ controller from a laptop with `OCI_AUTH_MODE=config-file`) is in
 2. **IAM:** the `manage cluster-node-pools` policy for the controller's
    identity (overlay README, section 2). On a Basic cluster set
    `OCI_AUTH_MODE=instance-principal` in the overlay.
-3. **Preflight:** `SIZE_CLASSES='<json with the pool OCIDs>' make oke-preflight`
-   must print no `WARN` lines.
-4. **Overlay:** put the pool OCIDs into `SIZE_CLASSES`, the region into
-   `OCI_RESOURCE_PRINCIPAL_REGION`, and the OCIR image into
-   `deploy/overlays/oke-managed-nodes/kustomization.yaml`; `ocirsecret` as in
-   step 3 of Deploy on OKE.
+3. **Overlay:** put the pool OCIDs and per-class cpu/memory into
+   `deploy/overlays/oke-managed-nodes/size-classes.yaml`, the region into
+   `OCI_RESOURCE_PRINCIPAL_REGION` in `deployment-patch.yaml`, and the OCIR
+   image into `kustomization.yaml`; `ocirsecret` as in step 3 of Deploy on OKE.
+4. **Preflight:** `make oke-preflight` (reads that file) must print no `WARN`
+   lines.
 5. **Deploy:** `make oke-deploy OVERLAY=oke-managed-nodes IMAGE=...`, then
    check the start-up log line for `controller-managed nodes enabled` with
    your pools and auth mode.

@@ -34,7 +34,8 @@ kind-down:
 oke-push:
 	docker buildx build --platform $(PLATFORM) -t $(IMAGE) --push .
 
-## Check the node pools named in SIZE_CLASSES before deploying NODE_MODE=oke
+## Check the node pools in deploy/overlays/oke-managed-nodes/size-classes.yaml
+## (or SIZE_CLASSES_FILE / SIZE_CLASSES) before deploying NODE_MODE=oke
 oke-preflight:
 	./hack/oke-preflight.sh
 

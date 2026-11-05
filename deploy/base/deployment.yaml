@@ -38,7 +38,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            # Node label(s) worker pods must match. "k=v,k2=v2".
+            # Node label(s) worker pods must match ("k=v,k2=v2").
             - name: WORKER_NODE_SELECTOR
               value: "workload=worker"
             - name: WORKER_SERVICE_ACCOUNT
@@ -52,45 +52,19 @@ spec:
               value: 24h
             - name: WORKER_MAX_TIMEOUT
               value: 24h
-            # Fail fast when no node matches the selector.
-            - name: WORKER_SCHEDULE_TIMEOUT
-              value: 2m
-            # Fail fast when the worker image cannot be pulled.
-            - name: WORKER_IMAGE_PULL_TIMEOUT
-              value: 3m
-            # Retry transient API-server errors this long before failing a job.
-            - name: API_RETRY_WINDOW
-              value: 2m
-            # Reap worker pods that no in-flight job owns.
-            - name: SWEEP_INTERVAL
-              value: 5m
-            # --- Size classes and node lifecycle --------------------------
-            # Who provides the node a worker pod runs on:
-            #   none  Cluster Autoscaler, Karpenter or a virtual-node pool reacts
-            #         to the pending pod (see deploy/addons/*)
-            #   oke   the controller grows the class's OKE node pool by one, pins
-            #         the pod to that node and deletes the node afterwards
-            #         (needs OCI credentials; see deploy/overlays/oke-managed-nodes)
-            - name: NODE_MODE
-              value: none
-            # name -> pod resources (requests = limits), extra node selector /
-            # tolerations, and in oke mode the node pool to grow.
-            - name: SIZE_CLASSES
-              value: '{"default":{"cpu":"500m","memory":"256Mi"}}'
-            - name: DEFAULT_SIZE_CLASS
-              value: default
-            # Required pod anti-affinity: two scans never share a node.
-            - name: ONE_POD_PER_NODE
-              value: "true"
-            # oke mode: scale-up + boot + join must complete within this.
-            - name: NODE_PROVISION_TIMEOUT
-              value: 15m
+            # Simultaneous scans (each holds a node in NODE_MODE=oke).
             - name: MAX_CONCURRENT
               value: "10"
-            - name: KEEP_FAILED_PODS
-              value: "false"
             - name: LOG_LEVEL
               value: info
+            # Size classes and node mode are set by the overlays:
+            #   deploy/overlays/oke               NODE_MODE=none (autoscaler-provided nodes)
+            #   deploy/overlays/oke-managed-nodes NODE_MODE=oke + size-classes.yaml
+            # Tuning knobs with sensible defaults (README, "Tuning knobs"):
+            #   WORKER_SCHEDULE_TIMEOUT=2m  WORKER_IMAGE_PULL_TIMEOUT=3m
+            #   NODE_PROVISION_TIMEOUT=15m  API_RETRY_WINDOW=2m  SWEEP_INTERVAL=5m
+            #   ONE_POD_PER_NODE=true  KEEP_FAILED_PODS=false
+            #   MAX_LOG_BYTES=262144  WORKER_LOG_TAIL_LINES=1000
           readinessProbe:
             httpGet:
               path: /readyz
