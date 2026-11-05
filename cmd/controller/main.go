@@ -54,6 +54,7 @@ func run() error {
 		"imagePullSecrets", cfg.ImagePullSecrets,
 		"maxConcurrent", cfg.MaxConcurrent,
 		"defaultTimeout", cfg.DefaultTimeout,
+		"maxTimeout", cfg.MaxTimeout,
 		"scheduleTimeout", cfg.ScheduleTimeout,
 		"imagePullTimeout", cfg.ImagePullTimeout,
 		"apiRetryWindow", cfg.APIRetryWindow,
@@ -90,6 +91,7 @@ func run() error {
 		ImagePullTimeout: cfg.ImagePullTimeout,
 		APIRetryWindow:   cfg.APIRetryWindow,
 		MaxLogBytes:      cfg.MaxLogBytes,
+		LogTailLines:     cfg.LogTailLines,
 		KeepFailedPods:   cfg.KeepFailedPods,
 		Classes:          cfg.SizeClasses,
 		DefaultClass:     cfg.DefaultSizeClass,
@@ -112,6 +114,7 @@ func run() error {
 		DefaultImage:  cfg.DefaultImage,
 		Classes:       cfg.SizeClasses,
 		DefaultClass:  cfg.DefaultSizeClass,
+		MaxTimeout:    cfg.MaxTimeout,
 	}, log)
 
 	httpSrv := &http.Server{

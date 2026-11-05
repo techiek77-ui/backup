@@ -30,11 +30,13 @@ spec:
             - name: NODE_PROVISION_TIMEOUT
               value: 15m
             # How the controller authenticates to OCI:
-            #   workload-identity  enhanced clusters; IAM policy on this
+            #   auto               workload-identity when running in-cluster
+            #   workload-identity  Enhanced clusters; IAM policy on this
             #                      ServiceAccount (README in this directory)
-            #   instance-principal basic clusters; dynamic group + policy
+            #   instance-principal Basic clusters; dynamic group + policy
+            # Set instance-principal explicitly on a Basic cluster.
             - name: OCI_AUTH_MODE
-              value: workload-identity
-            # Required for workload-identity, e.g. eu-frankfurt-1
+              value: auto
+            # Required for workload-identity (ignored otherwise), e.g. eu-frankfurt-1
             - name: OCI_RESOURCE_PRINCIPAL_REGION
               value: REGION_IDENTIFIER

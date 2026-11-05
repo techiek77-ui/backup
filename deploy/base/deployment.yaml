@@ -45,8 +45,13 @@ spec:
               value: podspawner-worker
             - name: WORKER_DEFAULT_IMAGE
               value: busybox:1.36
+            # Pod deadline when a request has no timeoutSeconds, and the cap
+            # for timeoutSeconds. Scans are long and variable: pass
+            # timeoutSeconds per request and keep the cap as the safety net.
             - name: WORKER_DEFAULT_TIMEOUT
-              value: 10m
+              value: 24h
+            - name: WORKER_MAX_TIMEOUT
+              value: 24h
             # Fail fast when no node matches the selector.
             - name: WORKER_SCHEDULE_TIMEOUT
               value: 2m

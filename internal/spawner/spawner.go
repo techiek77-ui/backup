@@ -56,8 +56,11 @@ type Config struct {
 	// APIRetryWindow is how long transient API-server errors (5xx, timeouts,
 	// connection failures) are retried before a job is failed.
 	APIRetryWindow time.Duration
-	// MaxLogBytes caps how much log we keep per job.
-	MaxLogBytes int64
+	// MaxLogBytes caps how much log we keep per job; LogTailLines (when > 0)
+	// keeps the last N lines instead of the first bytes, so the summary at the
+	// end of a long scan survives.
+	MaxLogBytes  int64
+	LogTailLines int64
 	// KeepFailedPods leaves failed pods around for debugging instead of deleting.
 	KeepFailedPods bool
 
@@ -573,10 +576,12 @@ func (s *Spawner) observe(jobID string, p *corev1.Pod, st *podState) {
 
 func (s *Spawner) fetchLogs(ctx context.Context, name string, log *slog.Logger) string {
 	limit := s.cfg.MaxLogBytes
-	req := s.client.CoreV1().Pods(s.cfg.Namespace).GetLogs(name, &corev1.PodLogOptions{
-		Container:  ContainerName,
-		LimitBytes: &limit,
-	})
+	opts := &corev1.PodLogOptions{Container: ContainerName, LimitBytes: &limit}
+	if s.cfg.LogTailLines > 0 {
+		tail := s.cfg.LogTailLines
+		opts.TailLines = &tail
+	}
+	req := s.client.CoreV1().Pods(s.cfg.Namespace).GetLogs(name, opts)
 	rc, err := req.Stream(ctx)
 	if err != nil {
 		log.Warn("could not fetch logs", "err", err)

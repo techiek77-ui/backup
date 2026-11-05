@@ -241,3 +241,18 @@ func TestSubmitSizeClass(t *testing.T) {
 		t.Fatalf("large view = %v", large)
 	}
 }
+
+func TestSubmitTimeoutCap(t *testing.T) {
+	ts, s, _ := newTestServer(t, Options{MaxConcurrent: 1, MaxTimeout: time.Hour}, 0)
+	resp, body := post(t, ts, `{"image":"scanner","timeoutSeconds":7200}`)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(body["error"].(string), "WORKER_MAX_TIMEOUT") {
+		t.Fatalf("over cap: %d %v", resp.StatusCode, body)
+	}
+	resp, _ = post(t, ts, `{"image":"scanner","timeoutSeconds":3600}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("at cap must be accepted: %d", resp.StatusCode)
+	}
+	if err := s.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -24,11 +24,13 @@ type Config struct {
 	ImagePullSecrets []string
 	WorkerSA         string
 	DefaultTimeout   time.Duration
+	MaxTimeout       time.Duration // upper bound for a request's timeoutSeconds
 	ScheduleTimeout  time.Duration
 	ImagePullTimeout time.Duration
 	APIRetryWindow   time.Duration
 	SweepInterval    time.Duration
 	MaxLogBytes      int64
+	LogTailLines     int64 // keep the last N lines of a worker's log (0 = from the start)
 	MaxConcurrent    int
 	KeepFailedPods   bool
 	DefaultImage     string
@@ -68,7 +70,8 @@ func FromEnv() (Config, error) {
 		Namespace:        envStr("POD_NAMESPACE", "podspawner"),
 		Kubeconfig:       os.Getenv("KUBECONFIG"),
 		WorkerSA:         os.Getenv("WORKER_SERVICE_ACCOUNT"),
-		MaxLogBytes:      int64(envInt("MAX_LOG_BYTES", 64*1024)),
+		MaxLogBytes:      int64(envInt("MAX_LOG_BYTES", 256*1024)),
+		LogTailLines:     int64(envInt("WORKER_LOG_TAIL_LINES", 1000)),
 		MaxConcurrent:    envInt("MAX_CONCURRENT", 10),
 		KeepFailedPods:   envBool("KEEP_FAILED_PODS", false),
 		DefaultImage:     envStr("WORKER_DEFAULT_IMAGE", "busybox:1.36"),
@@ -78,7 +81,8 @@ func FromEnv() (Config, error) {
 		OnePodPerNode:    envBool("ONE_POD_PER_NODE", true),
 		ProvisionTimeout: 15 * time.Minute,
 		OCIAuthMode:      strings.ToLower(envStr("OCI_AUTH_MODE", OCIAuthAuto)),
-		DefaultTimeout:   10 * time.Minute,
+		DefaultTimeout:   24 * time.Hour,
+		MaxTimeout:       24 * time.Hour,
 		ScheduleTimeout:  2 * time.Minute,
 		ImagePullTimeout: 3 * time.Minute,
 		APIRetryWindow:   2 * time.Minute,
@@ -90,6 +94,9 @@ func FromEnv() (Config, error) {
 		return c, fmt.Errorf("WORKER_NODE_SELECTOR: %w", err)
 	}
 	if c.DefaultTimeout, err = envDuration("WORKER_DEFAULT_TIMEOUT", c.DefaultTimeout); err != nil {
+		return c, err
+	}
+	if c.MaxTimeout, err = envDuration("WORKER_MAX_TIMEOUT", c.MaxTimeout); err != nil {
 		return c, err
 	}
 	if c.ScheduleTimeout, err = envDuration("WORKER_SCHEDULE_TIMEOUT", c.ScheduleTimeout); err != nil {
@@ -108,13 +115,19 @@ func FromEnv() (Config, error) {
 		return c, err
 	}
 	for name, d := range map[string]time.Duration{
-		"WORKER_DEFAULT_TIMEOUT": c.DefaultTimeout, "WORKER_SCHEDULE_TIMEOUT": c.ScheduleTimeout,
+		"WORKER_DEFAULT_TIMEOUT": c.DefaultTimeout, "WORKER_MAX_TIMEOUT": c.MaxTimeout, "WORKER_SCHEDULE_TIMEOUT": c.ScheduleTimeout,
 		"WORKER_IMAGE_PULL_TIMEOUT": c.ImagePullTimeout, "API_RETRY_WINDOW": c.APIRetryWindow,
 		"SWEEP_INTERVAL": c.SweepInterval, "NODE_PROVISION_TIMEOUT": c.ProvisionTimeout,
 	} {
 		if d <= 0 {
 			return c, fmt.Errorf("%s must be > 0", name)
 		}
+	}
+	if c.DefaultTimeout > c.MaxTimeout {
+		return c, fmt.Errorf("WORKER_DEFAULT_TIMEOUT (%s) must not exceed WORKER_MAX_TIMEOUT (%s)", c.DefaultTimeout, c.MaxTimeout)
+	}
+	if c.LogTailLines < 0 {
+		return c, fmt.Errorf("WORKER_LOG_TAIL_LINES must be >= 0")
 	}
 	if c.SizeClasses, err = ParseSizeClasses(os.Getenv("SIZE_CLASSES")); err != nil {
 		return c, err

@@ -48,7 +48,7 @@ pod's resources and which pool/shape serves it.
 
 | Method & path | Description |
 | --- | --- |
-| `POST /work` | Submit work. Body: `{"image":"busybox:1.36","command":["sh","-c","echo hi"],"args":[],"timeoutSeconds":120,"size":"small"}`. `image` defaults to `WORKER_DEFAULT_IMAGE`, `size` to `DEFAULT_SIZE_CLASS`; an unknown size is a `400` listing the valid ones. Returns `202 Accepted` with the job and a `Location` header. |
+| `POST /work` | Submit work. Body: `{"image":"busybox:1.36","command":["sh","-c","echo hi"],"args":[],"timeoutSeconds":120,"size":"small"}`. `image` defaults to `WORKER_DEFAULT_IMAGE`, `size` to `DEFAULT_SIZE_CLASS`, `timeoutSeconds` to `WORKER_DEFAULT_TIMEOUT` and may not exceed `WORKER_MAX_TIMEOUT`; an unknown size or an over-cap timeout is a `400` saying why. Returns `202 Accepted` with the job and a `Location` header. |
 | `GET /work/{id}` | Job status (`Pending` → `Provisioning` (oke mode) → `Running` → `Succeeded`/`Failed`), pod name, node name and (oke mode) node OCID, exit code, logs, error, and an in-flight `message` such as `node …abcd is CREATING`, `Unschedulable: 0/3 nodes are available …` or `ErrImagePull: …`. |
 | `GET /sizes` | The configured size classes and the default. |
 
@@ -316,7 +316,8 @@ one of the `workload=worker` nodes; afterwards it is gone.
 | `WORKER_IMAGE_PULL_SECRET` | – | Comma-separated secret names for worker image pulls. |
 | `WORKER_SERVICE_ACCOUNT` | `podspawner-worker` | SA for worker pods (no permissions, token not mounted). |
 | `WORKER_DEFAULT_IMAGE` | `busybox:1.36` | Used when a request omits `image`. |
-| `WORKER_DEFAULT_TIMEOUT` | `10m` | Pod `activeDeadlineSeconds` when the request omits `timeoutSeconds`. |
+| `WORKER_DEFAULT_TIMEOUT` | `24h` | Pod `activeDeadlineSeconds` when the request omits `timeoutSeconds`. Scans are long and variable: send `timeoutSeconds` per request. |
+| `WORKER_MAX_TIMEOUT` | `24h` | Cap for a request's `timeoutSeconds` (`400` above it); the default must not exceed it. |
 | `WORKER_SCHEDULE_TIMEOUT` | `2m` | Fail the job if the pod is still unscheduled after this long. |
 | `WORKER_IMAGE_PULL_TIMEOUT` | `3m` | Fail the job if its image is still unpullable (`ErrImagePull` / `ImagePullBackOff`) after this long; `InvalidImageName` fails at once. |
 | `API_RETRY_WINDOW` | `2m` | Retry transient API-server errors (5xx, timeouts, connection failures) for this long before failing a job. |
@@ -328,7 +329,8 @@ one of the `workload=worker` nodes; afterwards it is gone.
 | `NODE_PROVISION_TIMEOUT` | `15m` | oke mode: scale-up + boot + join deadline per job. |
 | `OCI_AUTH_MODE` | `auto` | oke mode: `workload-identity`, `instance-principal`, `config-file`, or `auto` (workload identity in-cluster, config file outside). Workload identity also needs `OCI_RESOURCE_PRINCIPAL_REGION`. |
 | `MAX_CONCURRENT` | `10` | Max simultaneous worker pods; extra requests queue as `Pending`. |
-| `MAX_LOG_BYTES` | `65536` | Log bytes kept per job. |
+| `MAX_LOG_BYTES` | `262144` | Log bytes kept per job. |
+| `WORKER_LOG_TAIL_LINES` | `1000` | Keep the last N lines of the worker's log (the summary at the end of a long scan) rather than the first bytes; `0` = from the start. |
 | `KEEP_FAILED_PODS` | `false` | Leave failed pods in place for debugging. |
 | `PORT` | `8080` | HTTP port. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
@@ -388,7 +390,8 @@ sequenceDiagram
    server closes, or that expires with `410 Gone`, is re-established from a
    fresh GET; API errors on the GET/watch are retried like the create.
 4. **Collect.** On `Succeeded` or `Failed` the controller reads the container
-   logs (capped at `MAX_LOG_BYTES`), the exit code and the node, and records
+   logs (the last `WORKER_LOG_TAIL_LINES` lines, capped at `MAX_LOG_BYTES`),
+   the exit code and the node, and records
    the failure reason (`DeadlineExceeded`, `Evicted: ...`, `OOMKilled (exit
    code 137)`, `container exited with code N`).
 5. **Delete.** Always, also on timeouts, errors and controller shutdown
@@ -478,6 +481,33 @@ Setup (pools, IAM for Workload Identity / Instance Principal, running the
 controller from a laptop with `OCI_AUTH_MODE=config-file`) is in
 `deploy/overlays/oke-managed-nodes/README.md`.
 
+#### First-run checklist (controller-managed nodes)
+
+1. **Pools:** one node pool per size class, size 0, the class's shape, an OKE
+   image, initial node label `workload=worker`, not autoscaled, nothing else
+   on it. Note each pool OCID. (In the Console the node pool form has these
+   fields; with the CLI, `oci ce node-pool create --generate-full-command-json-input`
+   prints the full template.)
+2. **IAM:** the `manage cluster-node-pools` policy for the controller's
+   identity (overlay README, section 2). On a Basic cluster set
+   `OCI_AUTH_MODE=instance-principal` in the overlay.
+3. **Preflight:** `SIZE_CLASSES='<json with the pool OCIDs>' make oke-preflight`
+   must print no `WARN` lines.
+4. **Overlay:** put the pool OCIDs into `SIZE_CLASSES`, the region into
+   `OCI_RESOURCE_PRINCIPAL_REGION`, and the OCIR image into
+   `deploy/overlays/oke-managed-nodes/kustomization.yaml`; `ocirsecret` as in
+   step 3 of Deploy on OKE.
+5. **Deploy:** `make oke-deploy OVERLAY=oke-managed-nodes IMAGE=...`, then
+   check the start-up log line for `controller-managed nodes enabled` with
+   your pools and auth mode.
+6. **First scan:** `SIZE=small ./hack/demo.sh` and, in another terminal,
+   `watch -n5 'kubectl get nodes -l workload=worker; kubectl -n podspawner get pods -o wide'`.
+   Expect `Provisioning` for a few minutes, `Running` on the new node, then
+   the node gone.
+7. **Tune:** read `nodeReadyAt - createdAt` from `GET /work/{id}` and set
+   `NODE_PROVISION_TIMEOUT` to a comfortable multiple; then run a real scan
+   with its own `timeoutSeconds`.
+
 ### Autoscaler-provided nodes (`NODE_MODE=none`)
 
 The pod carries `nodeSelector` (global + class), the class resources and the
@@ -513,7 +543,7 @@ variable is how long it takes, which these timers govern:
 | --- | --- | --- |
 | `WORKER_SCHEDULE_TIMEOUT` | 2 min | the pod still has no node |
 | `WORKER_IMAGE_PULL_TIMEOUT` | 3 min | the pod has a node but its image cannot be pulled |
-| `activeDeadlineSeconds` | request `timeoutSeconds`, else `WORKER_DEFAULT_TIMEOUT` (10 min) | the pod runs too long; enforced by the kubelet, so it counts only once the pod has started |
+| `activeDeadlineSeconds` | request `timeoutSeconds`, else `WORKER_DEFAULT_TIMEOUT` (24 h) | the pod runs too long; enforced by the kubelet, so it counts only once the pod has started |
 | internal backstop | deadline + 30 s | the kubelet never enforces the deadline (node lost after binding) |
 | `API_RETRY_WINDOW` | 2 min | the API server keeps failing a create/get/watch/delete |
 | delete confirmation | 45 s | a deleted pod is still `Terminating`; then it is force-deleted |
@@ -552,9 +582,10 @@ nodes (OCI `Out of host capacity`, common on A1 shapes).
   without drain): the node goes NotReady after roughly 40–50 s; Kubernetes
   evicts the pod after the default 5-minute `not-ready`/`unreachable`
   toleration, but with no kubelet to confirm, the pod sits in `Terminating`.
-  The controller keeps watching until the backstop (default ~10.5 min), then
-  the job is `Failed` with `timed out after 10m30s waiting for pod to finish`
-  and no logs. The delete is confirmed for 45 s and the stuck pod is then
+  The controller keeps watching until the backstop (the request's timeout
+  + 30 s; with the 24 h default that is a long wait, another reason to send
+  `timeoutSeconds` per scan), then the job is `Failed` with `timed out after
+  … waiting for pod to finish` and no logs. The delete is confirmed for 45 s and the stuck pod is then
   force-deleted. If the Node object is removed first (OKE's cloud controller
   deletes it once the instance is gone and pod GC reaps the pod), the
   controller sees the deletion instead and the error reads `pod was deleted
@@ -689,8 +720,12 @@ Be aware of what has and has not been exercised:
 ## Known limitations (it is a PoC)
 
 * Job state is in memory: a controller restart forgets jobs, aborts in-flight
-  work and returns `404` for earlier IDs. Persist jobs (StatefulSet + PVC, or a
-  CRD) for anything beyond a PoC; see Design notes.
+  work and returns `404` for earlier IDs. With hours-long scans this is the
+  limitation that bites first: a controller rollout or node drain aborts
+  every scan in flight (and in oke mode reclaims their nodes). Do not roll
+  the controller while scans run, and persist jobs (StatefulSet + PVC, or a
+  CRD that survives restarts) before relying on this in production; see
+  Design notes.
 * No authentication or authorization on the API, and callers choose the image
   and command: treat the endpoint as trusted-network only.
 * Failed work is not retried automatically; the client resubmits.

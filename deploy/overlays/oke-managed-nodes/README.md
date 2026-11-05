@@ -34,8 +34,12 @@ SIZE_CLASSES='<the JSON from deployment-patch.yaml>' make oke-preflight
 The controller calls `GetNodePool`, `UpdateNodePool` (size) and `DeleteNode`.
 All three are covered by `manage cluster-node-pools`.
 
+The overlay ships `OCI_AUTH_MODE=auto`, which means Workload Identity
+in-cluster. On a **Basic** cluster set `OCI_AUTH_MODE=instance-principal`
+instead; everything else is the same.
+
 **Enhanced cluster: Workload Identity** (recommended, no keys anywhere).
-`OCI_AUTH_MODE=workload-identity` plus `OCI_RESOURCE_PRINCIPAL_REGION`:
+`OCI_AUTH_MODE=auto` or `workload-identity`, plus `OCI_RESOURCE_PRINCIPAL_REGION`:
 
 ```text
 Allow any-user to manage cluster-node-pools in compartment <compartment-name> where all {

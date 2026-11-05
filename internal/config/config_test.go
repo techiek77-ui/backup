@@ -136,6 +136,9 @@ func TestFromEnvNodeModes(t *testing.T) {
 	if c.NodeMode != NodeModeNone || !c.OnePodPerNode || c.ProvisionTimeout != 15*time.Minute || c.OCIAuthMode != OCIAuthAuto {
 		t.Errorf("defaults: %+v", c)
 	}
+	if c.DefaultTimeout != 24*time.Hour || c.MaxTimeout != 24*time.Hour || c.LogTailLines != 1000 || c.MaxLogBytes != 256*1024 {
+		t.Errorf("long-scan defaults: default=%s max=%s tail=%d bytes=%d", c.DefaultTimeout, c.MaxTimeout, c.LogTailLines, c.MaxLogBytes)
+	}
 
 	t.Setenv("NODE_MODE", "oke")
 	if c, err := FromEnv(); err != nil || c.SizeClasses["large"].NodePoolID != "" {
@@ -170,6 +173,12 @@ func TestFromEnvNodeModes(t *testing.T) {
 	t.Setenv("OCI_AUTH_MODE", "password")
 	if _, err := FromEnv(); err == nil {
 		t.Error("unknown OCI_AUTH_MODE must error")
+	}
+	t.Setenv("OCI_AUTH_MODE", "")
+	t.Setenv("WORKER_DEFAULT_TIMEOUT", "48h")
+	t.Setenv("WORKER_MAX_TIMEOUT", "24h")
+	if _, err := FromEnv(); err == nil {
+		t.Error("default timeout above the max must error")
 	}
 }
 

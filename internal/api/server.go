@@ -41,6 +41,8 @@ type Options struct {
 	// DefaultClass is applied when it is empty.
 	Classes      map[string]config.SizeClass
 	DefaultClass string
+	// MaxTimeout caps a request's timeoutSeconds; zero means no cap.
+	MaxTimeout time.Duration
 }
 
 type Server struct {
@@ -145,6 +147,10 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if spec.TimeoutSeconds < 0 {
 		writeError(w, http.StatusBadRequest, "timeoutSeconds must be >= 0")
+		return
+	}
+	if max := int64(s.opts.MaxTimeout.Seconds()); max > 0 && spec.TimeoutSeconds > max {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeoutSeconds must be <= %d (WORKER_MAX_TIMEOUT=%s)", max, s.opts.MaxTimeout))
 		return
 	}
 	if spec.Size = strings.TrimSpace(spec.Size); spec.Size == "" {
