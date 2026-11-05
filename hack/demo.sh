@@ -8,6 +8,8 @@ NS="${NS:-podspawner}"
 PORT="${PORT:-8080}"
 IMAGE="${WORKER_IMAGE:-busybox:1.36}"
 SLEEP="${WORK_SECONDS:-15}"
+SIZE_FIELD=""
+[ -n "${SIZE:-}" ] && SIZE_FIELD=",\"size\":\"${SIZE}\""
 BASE="http://localhost:${PORT}"
 
 command -v jq >/dev/null || { echo "this script needs jq" >&2; exit 1; }
@@ -27,7 +29,7 @@ kubectl -n "$NS" get pods -l app.kubernetes.io/name=podspawner-worker -o wide 2>
 echo
 echo "==> POST /work"
 ID=$(curl -sf -X POST "$BASE/work" -H 'content-type: application/json' -d @- <<EOF | tee /dev/stderr | jq -r .id
-{"image":"$IMAGE","command":["sh","-c","echo hello from \$(hostname); echo working for ${SLEEP}s; sleep ${SLEEP}; echo done"]}
+{"image":"$IMAGE","command":["sh","-c","echo hello from \$(hostname); echo working for ${SLEEP}s; sleep ${SLEEP}; echo done"]${SIZE_FIELD}}
 EOF
 )
 echo

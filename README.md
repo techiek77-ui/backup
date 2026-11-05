@@ -1,10 +1,18 @@
 # podspawner — on-demand worker pods on Kubernetes (PoC)
 
 One always-running **controller pod** exposes a small HTTP API. Every work
-request makes it **spawn a short-lived worker pod** on a **labelled node**,
-wait for the pod to finish, collect the exit code and logs, and **delete the
-pod**. Targets Oracle Container Engine for Kubernetes (OKE) managed node
-pools; a local [kind](https://kind.sigs.k8s.io/) demo is included.
+request (a PII scan of one customer datasource, in the motivating use case)
+makes it **bring up a node and spawn a short-lived worker pod on it**, wait
+for the pod to finish, collect the exit code and logs, and **delete the pod
+and the node**, so compute is paid for only while a scan runs. Targets
+Oracle Container Engine for Kubernetes (OKE); a local
+[kind](https://kind.sigs.k8s.io/) demo covers the pod lifecycle.
+
+Four ways of getting the node are supported and documented in
+[Node lifecycle modes](#node-lifecycle-modes): the controller driving OKE
+node pools itself, the Cluster Autoscaler, Karpenter for OCI, or OKE virtual
+nodes. Requests carry a **size class** (`small`, `large`, …) that decides the
+pod's resources and which pool/shape serves it.
 
 ```
  client ──POST /work──▶ ┌──────────────────────────┐
@@ -26,19 +34,23 @@ pools; a local [kind](https://kind.sigs.k8s.io/) demo is included.
 | `cmd/controller` | entrypoint: config, k8s client, HTTP server, graceful shutdown |
 | `internal/api` | HTTP handlers, job IDs, concurrency cap / queueing |
 | `internal/spawner` | builds the worker Pod, watches it, fetches logs, deletes it |
+| `internal/nodes` | `Provisioner` interface and the OKE implementation (grow pool, claim node, pin, delete node) |
 | `internal/store` | in-memory job state |
 | `internal/config` | env-var parsing |
 | `deploy/base` | Namespace, RBAC, Deployment, ClusterIP Service (kustomize) |
 | `deploy/overlays/kind` | local demo overlay |
-| `deploy/overlays/oke` | OKE overlay: OCIR image, pull secret, node selector; optional internal OCI LB |
+| `deploy/overlays/oke` | OKE overlay, nodes provided by an autoscaler: OCIR image, pull secret, node selector; optional internal OCI LB |
+| `deploy/overlays/oke-managed-nodes` | OKE overlay, controller-managed nodes (`NODE_MODE=oke`) with its IAM README |
+| `deploy/addons` | Cluster Autoscaler manifest, Karpenter NodePools/OCINodeClasses, virtual-node notes |
 | `hack/` | `kind-up.sh` (cluster + label + build + deploy), `demo.sh` (end-to-end run) |
 
 ## API
 
 | Method & path | Description |
 | --- | --- |
-| `POST /work` | Submit work. Body: `{"image":"busybox:1.36","command":["sh","-c","echo hi"],"args":[],"timeoutSeconds":120}`. `image` defaults to `WORKER_DEFAULT_IMAGE`. Returns `202 Accepted` with the job and a `Location` header. |
-| `GET /work/{id}` | Job status (`Pending` → `Running` → `Succeeded`/`Failed`), pod + node name, exit code, logs, error, and an in-flight `message` such as `Unschedulable: 0/3 nodes are available …` or `ErrImagePull: …`. |
+| `POST /work` | Submit work. Body: `{"image":"busybox:1.36","command":["sh","-c","echo hi"],"args":[],"timeoutSeconds":120,"size":"small"}`. `image` defaults to `WORKER_DEFAULT_IMAGE`, `size` to `DEFAULT_SIZE_CLASS`; an unknown size is a `400` listing the valid ones. Returns `202 Accepted` with the job and a `Location` header. |
+| `GET /work/{id}` | Job status (`Pending` → `Provisioning` (oke mode) → `Running` → `Succeeded`/`Failed`), pod name, node name and (oke mode) node OCID, exit code, logs, error, and an in-flight `message` such as `node …abcd is CREATING`, `Unschedulable: 0/3 nodes are available …` or `ErrImagePull: …`. |
+| `GET /sizes` | The configured size classes and the default. |
 | `GET /work` | All jobs, newest first (logs omitted). |
 | `GET /healthz`, `GET /readyz` | Probes. |
 
@@ -89,6 +101,15 @@ cluster runs:
 * The controller itself needs only what `deploy/base/rbac.yaml` grants:
   `pods` create/get/list/watch/delete and `pods/log` get, in its own
   namespace. No cluster-wide permissions and no access to secrets or nodes.
+
+**For controller-managed nodes (`NODE_MODE=oke`)**
+
+* One OKE node pool per size class, size 0, initial node label
+  `workload=worker`, not managed by any autoscaler and used by nothing else.
+* OCI IAM: `manage cluster-node-pools` for the controller's identity (Workload
+  Identity on Enhanced clusters, or an Instance Principal dynamic group), see
+  `deploy/overlays/oke-managed-nodes/README.md`.
+* Kubernetes RBAC: read-only `nodes` cluster-wide (in `deploy/base/rbac.yaml`).
 
 **Namespace policies that interact with pod creation**
 
@@ -292,7 +313,13 @@ one of the `workload=worker` nodes; afterwards it is gone.
 | `WORKER_SCHEDULE_TIMEOUT` | `2m` | Fail the job if the pod is still unscheduled after this long. |
 | `WORKER_IMAGE_PULL_TIMEOUT` | `3m` | Fail the job if its image is still unpullable (`ErrImagePull` / `ImagePullBackOff`) after this long; `InvalidImageName` fails at once. |
 | `API_RETRY_WINDOW` | `2m` | Retry transient API-server errors (5xx, timeouts, connection failures) for this long before failing a job. |
-| `SWEEP_INTERVAL` | `5m` | How often worker pods that no in-flight job owns are reaped. |
+| `SWEEP_INTERVAL` | `5m` | How often worker pods (and, in oke mode, nodes) that no in-flight job owns are reaped. |
+| `NODE_MODE` | `none` | `none`: an autoscaler or virtual-node pool provides nodes; `oke`: the controller grows/shrinks OKE node pools itself. |
+| `SIZE_CLASSES` | `{"default":{"cpu":"500m","memory":"256Mi"}}` | JSON: class → `cpu`, `memory` (pod requests = limits), optional `nodeSelector`, `tolerations`, `nodePoolId` (required in oke mode). |
+| `DEFAULT_SIZE_CLASS` | `default` | Class used when a request has no `size`. |
+| `ONE_POD_PER_NODE` | `true` | Required pod anti-affinity: never two worker pods on one node. |
+| `NODE_PROVISION_TIMEOUT` | `15m` | oke mode: scale-up + boot + join deadline per job. |
+| `OCI_AUTH_MODE` | `auto` | oke mode: `workload-identity`, `instance-principal`, `config-file`, or `auto` (workload identity in-cluster, config file outside). Workload identity also needs `OCI_RESOURCE_PRINCIPAL_REGION`. |
 | `MAX_CONCURRENT` | `10` | Max simultaneous worker pods; extra requests queue as `Pending`. |
 | `MAX_LOG_BYTES` | `65536` | Log bytes kept per job. |
 | `KEEP_FAILED_PODS` | `false` | Leave failed pods in place for debugging. |
@@ -360,6 +387,98 @@ sequenceDiagram
    replica with `strategy: Recreate` so two controllers never overlap (the
    new one's start-up sweep would otherwise delete the old one's pods).
 
+## Node lifecycle modes
+
+Only one thing differs between the four modes: **who creates and deletes the
+node**. The pod lifecycle above is identical, and in every mode a size
+class decides the pod's `cpu`/`memory` (requests = limits) and the labels
+that route it, and `ONE_POD_PER_NODE` guarantees a scan never shares a node.
+
+| Mode | Node created by | Node removed | Config | Credentials | Cluster |
+| --- | --- | --- | --- | --- | --- |
+| **Controller-managed** (`NODE_MODE=oke`) | the controller: `UpdateNodePool(size+1)` on the class's pool | the controller, right after the pod: `DeleteNode(isDecrementSize, PT0M)` | pool OCID per class, `deploy/overlays/oke-managed-nodes` | `manage cluster-node-pools` via Workload Identity or Instance Principal | any (Workload Identity needs Enhanced) |
+| **Cluster Autoscaler** (`NODE_MODE=none`) | the autoscaler, from the pending pod; pool min 0 | the autoscaler, `scale-down-unneeded-time` after the pod is gone (1m in our manifest) | pool per class with initial labels `workload=worker,size=<class>`; `deploy/addons/cluster-autoscaler` | autoscaler's own IAM | any |
+| **Karpenter for OCI** (`NODE_MODE=none`) | Karpenter, launching an instance that fits the pod | Karpenter, `consolidateAfter` (30s) once empty | `NodePool`/`OCINodeClass` per class; `deploy/addons/karpenter` | KPO's own IAM | Enhanced (per Oracle's examples) |
+| **Virtual nodes** (`NODE_MODE=none`) | nobody: the pod itself is the billed unit | nobody | class with the virtual-node selector/toleration; `deploy/addons/virtual-nodes` | none | Enhanced + VCN-native networking |
+
+**Which to pick.** Controller-managed gives the literal "node up → scan →
+node down" with the smallest idle tail and a fresh VM per scan; it is the
+most code and needs OCI credentials in the controller. Cluster Autoscaler is
+the standard Kubernetes answer with no cloud credentials in this controller
+and an idle tail of a minute or two. Karpenter is the newest and the most
+flexible about shapes. Virtual nodes remove node management entirely but
+trade VM-level isolation for pod-level isolation and have feature limits.
+All four are wired; switching is configuration.
+
+### Size classes
+
+```text
+SIZE_CLASSES='{"small":{"cpu":"1","memory":"2Gi","nodeSelector":{"size":"small"},"nodePoolId":"ocid1.nodepool.oc1..."},
+               "large":{"cpu":"8","memory":"32Gi","nodeSelector":{"size":"large"},"nodePoolId":"ocid1.nodepool.oc1..."}}'
+DEFAULT_SIZE_CLASS=small
+```
+
+A request names one with `"size":"large"`. `GET /sizes` lists them. Class
+`nodeSelector`/`tolerations` are merged over the global
+`WORKER_NODE_SELECTOR`/`WORKER_TOLERATIONS`; `nodePoolId` is used only in
+oke mode (and required there).
+
+### Controller-managed nodes, step by step (`NODE_MODE=oke`)
+
+1. `POST /work` → job `Provisioning`. The controller reads the class's pool,
+   raises its size by one (size changes per pool are serialised), and
+   registers the job as waiting. `message`: `node pool scaled to 1; waiting
+   for a new node`.
+2. It polls the pool. A node that is `CREATING`/`ACTIVE`, not owned by another
+   job, not being deleted, and not one that existed before this controller
+   started is claimed by the **oldest waiting job**. `message`: `node …abcd
+   is CREATING`.
+3. Once OKE reports the node `ACTIVE`, the controller waits for the matching
+   Kubernetes `Node` (`providerID` = instance OCID) to be Ready, schedulable
+   and initialised by the cloud controller. `message`: `… waiting for it to
+   join the cluster and become Ready`. If OKE instead reports a
+   `nodeError` (e.g. `Out of host capacity`), the job fails right away with
+   that message and the failed node is deleted, shrinking the pool again.
+4. The worker pod is created pinned to that node (`nodeAffinity` on
+   `metadata.name`) plus the class selector; job → `Running` with `nodeId`
+   and `nodeName`.
+5. Pod finishes → logs/exit code recorded → pod deleted → **node deleted**
+   with `isDecrementSize=true` and `overrideEvictionGraceDuration=PT0M`
+   (nothing left to drain), so the pool returns to its previous size.
+6. Sweeps: at start-up every node in the managed pools is deleted (job state
+   is in memory, nothing can be collected), and every `SWEEP_INTERVAL` any
+   node no active job owns is deleted. The pools must therefore be used by
+   nothing else.
+
+Setup (pools, IAM for Workload Identity / Instance Principal, running the
+controller from a laptop with `OCI_AUTH_MODE=config-file`) is in
+`deploy/overlays/oke-managed-nodes/README.md`.
+
+### Autoscaler-provided nodes (`NODE_MODE=none`)
+
+The pod carries `nodeSelector` (global + class), the class resources and the
+anti-affinity; the pod sits `Pending` until the autoscaler's node is Ready.
+Two settings matter: raise `WORKER_SCHEDULE_TIMEOUT` above scale-up + boot
+time (the default 2 min is for pools that already have nodes), and keep the
+controller and the autoscaler on a pool that never scales to zero. Manifests,
+flags and IAM: `deploy/addons/cluster-autoscaler`, `deploy/addons/karpenter`,
+`deploy/addons/virtual-nodes`.
+
+### Cost shape per scan
+
+| Mode | Billed compute per scan ≈ |
+| --- | --- |
+| Controller-managed | boot + scan + termination (seconds) |
+| Cluster Autoscaler | boot + scan + `scale-down-unneeded-time` (+ `scale-down-delay-after-add` if it is longer) |
+| Karpenter | boot + scan + `consolidateAfter` |
+| Virtual nodes | scan only (pod CPU/memory per second) |
+
+OCI bills compute per second with a one-minute minimum; the boot phase
+(several minutes on OKE managed nodes, fastest with OKE images) is paid in the
+first three modes. For short scans on a shared pool, packing scans together
+(`ONE_POD_PER_NODE=false`) would be cheaper than a node per scan; it was
+ruled out here for tenant isolation.
+
 ## What happens when a node or node pool is unavailable
 
 The controller never retries a job. Every scenario below ends with the job
@@ -425,6 +544,26 @@ nodes (OCI `Out of host capacity`, common on A1 shapes).
 * **Node-pressure eviction** (`Evicted: The node was low on resource: memory`)
   and **OOMKilled** (`OOMKilled (exit code 137)`): the pod reaches `Failed`
   normally; the job records that reason with logs, and the pod is deleted.
+
+### Controller-managed nodes (`NODE_MODE=oke`)
+
+* **OKE cannot create the node** (`Out of host capacity`, service limits,
+  quota): the job fails on the next poll with OKE's `nodeError` message, the
+  failed node is deleted with decrement, pool size is restored. Resubmit
+  later or use another class/shape.
+* **Node never becomes Ready** (boot or join problem): after
+  `NODE_PROVISION_TIMEOUT` the job fails with `node … did not become Ready`
+  and the node is deleted.
+* **No node appears at all** after the scale-up (OKE accepted the size change
+  but created nothing): the job fails with `no new node appeared in node pool
+  … within 15m`; if a node shows up later, the next sweep deletes it.
+* **OCI API errors**: `GetNodePool`/`UpdateNodePool`/`DeleteNode` are retried
+  on 409/429/5xx for `API_RETRY_WINDOW`; a node whose delete still failed is
+  removed by the next sweep.
+* **Controller restart**: the start-up sweep deletes every node in the managed
+  pools, including nodes of scans that were running (their jobs are gone with
+  the memory). Scans in flight at restart are lost in every mode; here their
+  nodes are also reclaimed instead of lingering.
 
 ### The controller itself
 
@@ -509,6 +648,12 @@ controller log (`kubectl -n podspawner logs deploy/podspawner`), and
 * No authentication or authorization on the API, and callers choose the image
   and command: treat the endpoint as trusted-network only.
 * Failed work is not retried automatically; the client resubmits.
+* In `NODE_MODE=oke` the managed node pools belong to the controller: any
+  node in them that no active scan owns is deleted, and a controller restart
+  empties them. Concurrency per pool is serialised (one size change at a
+  time), which is fine for tens of scans, not thousands.
+* A node per scan means every scan pays the node boot time (minutes on OKE);
+  virtual nodes avoid it at the price of weaker isolation.
 * The request queue is unbounded and in memory.
 * Logs are capped at `MAX_LOG_BYTES` and kept in memory.
 
@@ -526,3 +671,9 @@ controller log (`kubectl -n podspawner logs deploy/podspawner`), and
 * Using the Kubernetes Cluster Autoscaler on OKE — <https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengusingclusterautoscaler.htm>
 * Optimizing OKE costs with KEDA and Cluster Autoscaling (`--nodes=0:N:<ocid>`) — <https://blogs.oracle.com/cloud-infrastructure/optimizing-oke-costs-with-keda-and-cluster-autoscaling>
 * OCI Load Balancer flexible shape bounds (10–8000 Mbps) — <https://docs.oracle.com/en-us/iaas/tools/python/latest/api/load_balancer/models/oci.load_balancer.models.ShapeDetails.html>
+* Cluster Autoscaler OCI provider (node pools, scale from zero, IAM, env) — <https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/oci/README.md> and its node-pool example manifest; template built from `InitialNodeLabels` in `cloudprovider/oci/nodepools/oci_manager.go`
+* Deleting worker nodes (`DeleteNode`, `isDecrementSize`, eviction grace) — <https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengdeletingworkernodes.htm>
+* OCI Go SDK `containerengine` (`UpdateNodePool`, `DeleteNode`, node lifecycle states) and `common/auth` (`OkeWorkloadIdentityConfigurationProvider`, `InstancePrincipalConfigurationProvider`) — <https://github.com/oracle/oci-go-sdk>
+* Granting workloads access to OCI resources (Workload Identity, policy syntax) — <https://docs.cloud.oracle.com/en-us/iaas/Content/ContEng/Tasks/contenggrantingworkloadaccesstoresources.htm>
+* Karpenter Provider for OCI: usage (NodePool/OCINodeClass), IAM — <https://github.com/oracle/karpenter-provider-oci>; Oracle docs <https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/conteng-kpo.htm>
+* OKE virtual nodes (per-pod resources, limits) — <https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengvirtualnodepodresourceallocation.htm>; mixed clusters with virtual nodes — <https://blogs.oracle.com/cloud-infrastructure/mixed-oke-cluster-karpenter-and-virtual-nodes>

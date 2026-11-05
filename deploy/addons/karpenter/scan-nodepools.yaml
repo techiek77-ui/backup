@@ -1,0 +1,104 @@
+# Karpenter Provider for OCI (KPO): one NodePool + OCINodeClass per size
+# class. A pending worker pod with nodeSelector size=<class> makes Karpenter
+# launch a right-sized instance; WhenEmpty + consolidateAfter removes it
+# shortly after the pod is gone. Install KPO first (README.md here).
+#
+# Replace: <oke-image-ocid> (an OKE image for your Kubernetes version) and
+# <worker-subnet-ocid>; adjust shapes/limits to your tenancy.
+apiVersion: oci.oraclecloud.com/v1beta1
+kind: OCINodeClass
+metadata:
+  name: scan-small
+spec:
+  shapeConfigs:
+    - ocpus: 2
+      memoryInGbs: 8
+  volumeConfig:
+    bootVolumeConfig:
+      imageConfig:
+        imageType: OKEImage
+        imageId: <oke-image-ocid>
+  networkConfig:
+    primaryVnicConfig:
+      subnetConfig:
+        subnetId: <worker-subnet-ocid>
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: scan-small
+spec:
+  template:
+    metadata:
+      labels:
+        workload: worker
+        size: small
+    spec:
+      expireAfter: Never
+      nodeClassRef:
+        group: oci.oraclecloud.com
+        kind: OCINodeClass
+        name: scan-small
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: oci.oraclecloud.com/instance-shape
+          operator: In
+          values: ["VM.Standard.E4.Flex", "VM.Standard.E5.Flex"]
+      terminationGracePeriod: 10m
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s
+  limits:
+    cpu: 40
+    memory: 160Gi
+---
+apiVersion: oci.oraclecloud.com/v1beta1
+kind: OCINodeClass
+metadata:
+  name: scan-large
+spec:
+  shapeConfigs:
+    - ocpus: 8
+      memoryInGbs: 64
+  volumeConfig:
+    bootVolumeConfig:
+      imageConfig:
+        imageType: OKEImage
+        imageId: <oke-image-ocid>
+  networkConfig:
+    primaryVnicConfig:
+      subnetConfig:
+        subnetId: <worker-subnet-ocid>
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: scan-large
+spec:
+  template:
+    metadata:
+      labels:
+        workload: worker
+        size: large
+    spec:
+      expireAfter: Never
+      nodeClassRef:
+        group: oci.oraclecloud.com
+        kind: OCINodeClass
+        name: scan-large
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: oci.oraclecloud.com/instance-shape
+          operator: In
+          values: ["VM.Standard.E4.Flex", "VM.Standard.E5.Flex"]
+      terminationGracePeriod: 10m
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s
+  limits:
+    cpu: 64
+    memory: 512Gi

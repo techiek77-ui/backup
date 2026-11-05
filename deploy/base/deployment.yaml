@@ -59,6 +59,27 @@ spec:
             # Reap worker pods that no in-flight job owns.
             - name: SWEEP_INTERVAL
               value: 5m
+            # --- Size classes and node lifecycle --------------------------
+            # Who provides the node a worker pod runs on:
+            #   none  Cluster Autoscaler, Karpenter or a virtual-node pool reacts
+            #         to the pending pod (see deploy/addons/*)
+            #   oke   the controller grows the class's OKE node pool by one, pins
+            #         the pod to that node and deletes the node afterwards
+            #         (needs OCI credentials; see deploy/overlays/oke-managed-nodes)
+            - name: NODE_MODE
+              value: none
+            # name -> pod resources (requests = limits), extra node selector /
+            # tolerations, and in oke mode the node pool to grow.
+            - name: SIZE_CLASSES
+              value: '{"default":{"cpu":"500m","memory":"256Mi"}}'
+            - name: DEFAULT_SIZE_CLASS
+              value: default
+            # Required pod anti-affinity: two scans never share a node.
+            - name: ONE_POD_PER_NODE
+              value: "true"
+            # oke mode: scale-up + boot + join must complete within this.
+            - name: NODE_PROVISION_TIMEOUT
+              value: 15m
             - name: MAX_CONCURRENT
               value: "10"
             - name: KEEP_FAILED_PODS

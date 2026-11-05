@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podspawner
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: ONE_POD_PER_NODE
+              value: "false"

@@ -23,6 +23,17 @@ spec:
             - name: WORKER_NODE_SELECTOR
               value: "workload=worker"
 
+            # Nodes come from an autoscaler here (NODE_MODE=none). With the
+            # Cluster Autoscaler or Karpenter manifests in deploy/addons, map
+            # each size class to its pool by label; one pool per class:
+            # - name: SIZE_CLASSES
+            #   value: '{"small":{"cpu":"1","memory":"2Gi","nodeSelector":{"size":"small"}},"large":{"cpu":"8","memory":"32Gi","nodeSelector":{"size":"large"}}}'
+            # - name: DEFAULT_SIZE_CLASS
+            #   value: small
+            # Node provisioning from zero takes minutes; give the scheduler time:
+            # - name: WORKER_SCHEDULE_TIMEOUT
+            #   value: 12m
+
             # Uncomment if worker images live in a private OCIR repo.
             # - name: WORKER_IMAGE_PULL_SECRET
             #   value: ocirsecret

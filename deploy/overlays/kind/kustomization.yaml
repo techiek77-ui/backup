@@ -19,3 +19,5 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: Never
+  # The demo cluster has one labelled node; let demo jobs run side by side.
+  - path: env-patch.yaml

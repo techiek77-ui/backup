@@ -12,18 +12,20 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/techiek77-ui/backup/internal/config"
+	"github.com/techiek77-ui/backup/internal/nodes"
 	"github.com/techiek77-ui/backup/internal/store"
 )
 
 const (
 	LabelApp   = "app.kubernetes.io/name"
 	LabelJobID = "podspawner.io/job-id"
+	LabelSize  = "podspawner.io/size"
 	AppName    = "podspawner-worker"
 	// ContainerName is the single container in every worker pod.
 	ContainerName = "worker"
@@ -59,6 +61,17 @@ type Config struct {
 	// KeepFailedPods leaves failed pods around for debugging instead of deleting.
 	KeepFailedPods bool
 
+	// Classes maps size class names to pod resources and placement;
+	// DefaultClass is used when a request names none.
+	Classes      map[string]config.SizeClass
+	DefaultClass string
+	// OnePodPerNode adds a required anti-affinity so two worker pods never
+	// share a node, whichever mechanism provides the nodes.
+	OnePodPerNode bool
+	// Provisioner, when set, brings up a dedicated node for every job before
+	// its pod is created and tears it down afterwards (NODE_MODE=oke).
+	Provisioner nodes.Provisioner
+
 	// Tunables for tests; zero means the production default.
 	retryBase    time.Duration // first retry backoff (1s)
 	deleteWait   time.Duration // wait for a graceful delete to complete (45s)
@@ -88,10 +101,24 @@ func New(client kubernetes.Interface, cfg Config, st *store.Store, log *slog.Log
 	if cfg.MaxLogBytes <= 0 {
 		cfg.MaxLogBytes = 64 * 1024
 	}
+	if len(cfg.Classes) == 0 {
+		cfg.Classes = config.DefaultSizeClasses()
+	}
+	if _, ok := cfg.Classes[cfg.DefaultClass]; !ok {
+		cfg.DefaultClass = config.ClassNames(cfg.Classes)[0]
+	}
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Spawner{client: client, cfg: cfg, store: st, log: log}
+}
+
+// ClassFor resolves a job's size class, falling back to the default.
+func (s *Spawner) ClassFor(job *store.Job) (string, config.SizeClass) {
+	if c, ok := s.cfg.Classes[job.Spec.Size]; ok && job.Spec.Size != "" {
+		return job.Spec.Size, c
+	}
+	return s.cfg.DefaultClass, s.cfg.Classes[s.cfg.DefaultClass]
 }
 
 func (s *Spawner) timeoutFor(job *store.Job) time.Duration {
@@ -101,15 +128,55 @@ func (s *Spawner) timeoutFor(job *store.Job) time.Duration {
 	return s.cfg.DefaultTimeout
 }
 
-// BuildPod returns the Pod manifest for a job. Exposed for tests and for
-// users who want to see exactly what gets submitted.
-func (s *Spawner) BuildPod(job *store.Job) *corev1.Pod {
+// BuildPod returns the Pod manifest for a job. pinnedNode, when set, is the
+// Kubernetes node the pod must run on (the node provisioned for it).
+// Exposed for tests and for users who want to see exactly what is submitted.
+func (s *Spawner) BuildPod(job *store.Job, pinnedNode string) *corev1.Pod {
 	deadline := int64(s.timeoutFor(job).Seconds())
 	automount := false
+	className, class := s.ClassFor(job)
 
 	var pullSecrets []corev1.LocalObjectReference
 	for _, name := range s.cfg.ImagePullSecrets {
 		pullSecrets = append(pullSecrets, corev1.LocalObjectReference{Name: name})
+	}
+
+	selector := map[string]string{}
+	for k, v := range s.cfg.NodeSelector {
+		selector[k] = v
+	}
+	for k, v := range class.NodeSelector {
+		selector[k] = v
+	}
+	if len(selector) == 0 {
+		selector = nil
+	}
+	tolerations := append(append([]corev1.Toleration(nil), s.cfg.Tolerations...), class.Tolerations...)
+
+	resources := corev1.ResourceList{corev1.ResourceCPU: class.CPU, corev1.ResourceMemory: class.Memory}
+
+	var affinity *corev1.Affinity
+	if pinnedNode != "" {
+		affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchFields: []corev1.NodeSelectorRequirement{{
+						Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{pinnedNode},
+					}},
+				}},
+			},
+		}}
+	}
+	if s.cfg.OnePodPerNode {
+		if affinity == nil {
+			affinity = &corev1.Affinity{}
+		}
+		affinity.PodAntiAffinity = &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{LabelApp: AppName}},
+				TopologyKey:   "kubernetes.io/hostname",
+			}},
+		}
 	}
 
 	return &corev1.Pod{
@@ -120,13 +187,15 @@ func (s *Spawner) BuildPod(job *store.Job) *corev1.Pod {
 			Labels: map[string]string{
 				LabelApp:   AppName,
 				LabelJobID: job.ID,
+				LabelSize:  className,
 			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
 			ActiveDeadlineSeconds:        &deadline,
-			NodeSelector:                 s.cfg.NodeSelector,
-			Tolerations:                  s.cfg.Tolerations,
+			NodeSelector:                 selector,
+			Tolerations:                  tolerations,
+			Affinity:                     affinity,
 			ImagePullSecrets:             pullSecrets,
 			ServiceAccountName:           s.cfg.ServiceAccount,
 			AutomountServiceAccountToken: &automount,
@@ -135,16 +204,9 @@ func (s *Spawner) BuildPod(job *store.Job) *corev1.Pod {
 				Image:   job.Spec.Image,
 				Command: job.Spec.Command,
 				Args:    job.Spec.Args,
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("50m"),
-						corev1.ResourceMemory: resource.MustParse("64Mi"),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("500m"),
-						corev1.ResourceMemory: resource.MustParse("256Mi"),
-					},
-				},
+				// requests == limits: Guaranteed QoS, and on Karpenter or
+				// virtual nodes the request is what sizes and bills the node.
+				Resources: corev1.ResourceRequirements{Requests: resources, Limits: resources.DeepCopy()},
 			}},
 		},
 	}
@@ -161,8 +223,37 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 		return
 	}
 	log := s.log.With("job", jobID)
+	_, class := s.ClassFor(job)
 
-	created, err := s.createPod(ctx, job, log)
+	pinned := ""
+	if s.cfg.Provisioner != nil {
+		s.store.Update(jobID, func(j *store.Job) {
+			j.Status = store.StatusProvisioning
+			j.Message = "bringing up a node"
+		})
+		node, err := s.cfg.Provisioner.Provision(ctx, jobID, class, func(msg string) {
+			s.store.Update(jobID, func(j *store.Job) { j.Message = msg })
+		})
+		if err != nil {
+			s.fail(jobID, "", fmt.Errorf("provision node: %w", err))
+			return
+		}
+		s.store.Update(jobID, func(j *store.Job) {
+			j.NodeID = node.ID
+			j.NodeName = node.Name
+			j.Message = ""
+		})
+		log = log.With("node", node.Name)
+		// Registered before the pod cleanup below, so it runs after it.
+		defer func() {
+			if err := s.cfg.Provisioner.Release(context.Background(), node); err != nil {
+				log.Error("failed to delete node; the periodic sweep will retry", "err", err)
+			}
+		}()
+		pinned = node.Name
+	}
+
+	created, err := s.createPod(ctx, job, pinned, log)
 	if err != nil {
 		s.fail(jobID, "", err)
 		return
@@ -229,7 +320,7 @@ func (s *Spawner) Run(ctx context.Context, jobID string) {
 // first looks for a pod already labelled with this job ID — the previous
 // request may have succeeded while its response was lost — and adopts it
 // rather than creating a duplicate.
-func (s *Spawner) createPod(ctx context.Context, job *store.Job, log *slog.Logger) (*corev1.Pod, error) {
+func (s *Spawner) createPod(ctx context.Context, job *store.Job, pinnedNode string, log *slog.Logger) (*corev1.Pod, error) {
 	pods := s.client.CoreV1().Pods(s.cfg.Namespace)
 	var created *corev1.Pod
 	attempt := 0
@@ -242,7 +333,7 @@ func (s *Spawner) createPod(ctx context.Context, job *store.Job, log *slog.Logge
 				return nil
 			}
 		}
-		p, err := pods.Create(ctx, s.BuildPod(job), metav1.CreateOptions{})
+		p, err := pods.Create(ctx, s.BuildPod(job, pinnedNode), metav1.CreateOptions{})
 		if err != nil {
 			return err
 		}
@@ -577,6 +668,17 @@ func (s *Spawner) Sweep(ctx context.Context) (int, error) {
 		s.log.Warn("deleting orphan worker pod", "pod", p.Name, "phase", p.Status.Phase, "job", jobID)
 		s.deletePod(p.Name, s.log.With("pod", p.Name))
 		n++
+	}
+	if s.cfg.Provisioner != nil {
+		active := func(jobID string) bool {
+			j, ok := s.store.Get(jobID)
+			return ok && !j.Status.Terminal()
+		}
+		deleted, err := s.cfg.Provisioner.Sweep(ctx, active)
+		n += deleted
+		if err != nil {
+			return n, fmt.Errorf("node sweep: %w", err)
+		}
 	}
 	return n, nil
 }

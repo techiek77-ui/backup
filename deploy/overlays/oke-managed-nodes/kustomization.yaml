@@ -1,0 +1,16 @@
+# OKE, controller-managed nodes (NODE_MODE=oke): the controller grows a node
+# pool by one for every scan, pins the pod to the new node and deletes that
+# node the moment the pod is done. Read README.md in this directory first.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: podspawner
+    newName: REGION_KEY.ocir.io/TENANCY_NAMESPACE/podspawner
+    newTag: 0.1.0
+
+patches:
+  - path: deployment-patch.yaml

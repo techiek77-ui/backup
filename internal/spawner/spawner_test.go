@@ -12,12 +12,15 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/techiek77-ui/backup/internal/config"
+	"github.com/techiek77-ui/backup/internal/nodes"
 	"github.com/techiek77-ui/backup/internal/store"
 )
 
@@ -166,7 +169,7 @@ func TestBuildPod(t *testing.T) {
 		DefaultTimeout:   5 * time.Minute,
 	})
 	job := &store.Job{ID: "abc123", Spec: store.WorkSpec{Image: "busybox", Command: []string{"sh", "-c", "true"}, TimeoutSeconds: 42}}
-	pod := h.sp.BuildPod(job)
+	pod := h.sp.BuildPod(job, "")
 
 	if pod.GenerateName != "work-abc123-" {
 		t.Errorf("generateName = %q", pod.GenerateName)
@@ -198,7 +201,7 @@ func TestBuildPod(t *testing.T) {
 
 	// Default timeout applies when the request does not set one.
 	job.Spec.TimeoutSeconds = 0
-	if got := *h.sp.BuildPod(job).Spec.ActiveDeadlineSeconds; got != 300 {
+	if got := *h.sp.BuildPod(job, "").Spec.ActiveDeadlineSeconds; got != 300 {
 		t.Errorf("default activeDeadlineSeconds = %d, want 300", got)
 	}
 }
@@ -603,4 +606,167 @@ func TestDeletePodForceDeletesStuckPod(t *testing.T) {
 		t.Fatal("expected a force delete after the graceful delete stalled")
 	}
 	h.assertPodGone(t, "stuck")
+}
+
+// fakeProvisioner stands in for the OKE provisioner.
+type fakeProvisioner struct {
+	mu        sync.Mutex
+	client    *fake.Clientset
+	nodeName  string
+	fail      error
+	provision []string // job IDs
+	released  []string // node IDs
+	podGone   []bool   // was the worker pod already deleted when Release ran?
+	sweeps    int
+}
+
+func (f *fakeProvisioner) Provision(ctx context.Context, jobID string, class config.SizeClass, report nodes.Reporter) (*nodes.Node, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return nil, f.fail
+	}
+	report("node CREATING")
+	f.provision = append(f.provision, jobID)
+	return &nodes.Node{ID: "ocid1.instance.oc1.iad." + jobID, Name: f.nodeName, PoolID: class.NodePoolID, JobID: jobID}, nil
+}
+
+func (f *fakeProvisioner) Release(ctx context.Context, n *nodes.Node) error {
+	list, _ := f.client.CoreV1().Pods(testNS).List(ctx, metav1.ListOptions{LabelSelector: LabelJobID + "=" + n.JobID})
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released = append(f.released, n.ID)
+	f.podGone = append(f.podGone, len(list.Items) == 0)
+	return nil
+}
+
+func (f *fakeProvisioner) Sweep(ctx context.Context, active func(string) bool) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweeps++
+	return 0, nil
+}
+
+func (f *fakeProvisioner) Pools() []string { return []string{"poolA"} }
+
+func bigClasses() map[string]config.SizeClass {
+	return map[string]config.SizeClass{
+		"default": {CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), NodePoolID: "poolDefault"},
+		"big": {
+			CPU: resource.MustParse("2"), Memory: resource.MustParse("4Gi"),
+			NodeSelector: map[string]string{"size": "big"},
+			Tolerations:  []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "scan", Effect: corev1.TaintEffectNoSchedule}},
+			NodePoolID:   "poolBig",
+		},
+	}
+}
+
+func TestBuildPodUsesSizeClassAndAffinity(t *testing.T) {
+	h := newHarness(t, Config{
+		NodeSelector:  map[string]string{"workload": "worker"},
+		Classes:       bigClasses(),
+		DefaultClass:  "default",
+		OnePodPerNode: true,
+	})
+	job := &store.Job{ID: "abc", Spec: store.WorkSpec{Image: "scanner", Size: "big"}}
+	pod := h.sp.BuildPod(job, "10.0.0.7")
+
+	c := pod.Spec.Containers[0]
+	if c.Resources.Requests.Cpu().String() != "2" || c.Resources.Requests.Memory().String() != "4Gi" ||
+		!c.Resources.Limits.Cpu().Equal(*c.Resources.Requests.Cpu()) || !c.Resources.Limits.Memory().Equal(*c.Resources.Requests.Memory()) {
+		t.Errorf("resources = %+v", c.Resources)
+	}
+	if pod.Spec.NodeSelector["workload"] != "worker" || pod.Spec.NodeSelector["size"] != "big" {
+		t.Errorf("nodeSelector should merge global and class: %v", pod.Spec.NodeSelector)
+	}
+	if len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "dedicated" {
+		t.Errorf("tolerations = %v", pod.Spec.Tolerations)
+	}
+	if pod.Labels[LabelSize] != "big" {
+		t.Errorf("size label = %q", pod.Labels[LabelSize])
+	}
+	na := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchFields[0]
+	if na.Key != "metadata.name" || na.Values[0] != "10.0.0.7" {
+		t.Errorf("node pin = %+v", na)
+	}
+	pa := pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+	if pa.TopologyKey != "kubernetes.io/hostname" || pa.LabelSelector.MatchLabels[LabelApp] != AppName {
+		t.Errorf("anti-affinity = %+v", pa)
+	}
+
+	// Unknown or empty size falls back to the default class; no pin, no anti-affinity when disabled.
+	h2 := newHarness(t, Config{Classes: bigClasses(), DefaultClass: "default"})
+	pod2 := h2.sp.BuildPod(&store.Job{ID: "def", Spec: store.WorkSpec{Image: "x", Size: "nope"}}, "")
+	if pod2.Labels[LabelSize] != "default" || pod2.Spec.Affinity != nil || pod2.Spec.Containers[0].Resources.Requests.Cpu().String() != "500m" {
+		t.Errorf("fallback pod wrong: label=%q affinity=%v cpu=%s", pod2.Labels[LabelSize], pod2.Spec.Affinity, pod2.Spec.Containers[0].Resources.Requests.Cpu())
+	}
+}
+
+func TestRunWithProvisionerPinsPodAndReleasesNodeAfterPod(t *testing.T) {
+	h := newHarness(t, Config{})
+	fp := &fakeProvisioner{client: h.client, nodeName: "10.0.0.7"}
+	h.sp.cfg.Provisioner = fp
+	h.sp.cfg.Classes = bigClasses()
+	h.sp.cfg.DefaultClass = "default"
+
+	done := h.submit(t, "job20", store.WorkSpec{Image: "scanner", Size: "big"})
+	h.awaitWatch(t)
+
+	j, _ := h.store.Get("job20")
+	if j.NodeID != "ocid1.instance.oc1.iad.job20" || j.NodeName != "10.0.0.7" || j.Status != store.StatusRunning {
+		t.Fatalf("job after provisioning = %+v", j)
+	}
+	pod := h.workerPod(t, "job20")
+	if v := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchFields[0].Values[0]; v != "10.0.0.7" {
+		t.Fatalf("pod must be pinned to the provisioned node, got %q", v)
+	}
+	h.finishPod(t, pod, corev1.PodSucceeded, 0)
+	waitDone(t, done)
+
+	j, _ = h.store.Get("job20")
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status = %s err=%q", j.Status, j.Error)
+	}
+	h.assertPodGone(t, pod.Name)
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	if len(fp.released) != 1 || fp.released[0] != "ocid1.instance.oc1.iad.job20" {
+		t.Fatalf("node not released: %v", fp.released)
+	}
+	if !fp.podGone[0] {
+		t.Fatal("node must be released only after the worker pod is deleted")
+	}
+}
+
+func TestRunProvisionFailureFailsJobWithoutPod(t *testing.T) {
+	h := newHarness(t, Config{})
+	fp := &fakeProvisioner{client: h.client, fail: errors.New("node pool could not create the node: InternalError: Out of host capacity.")}
+	h.sp.cfg.Provisioner = fp
+
+	done := h.submit(t, "job21", store.WorkSpec{Image: "scanner"})
+	waitDone(t, done)
+
+	j, _ := h.store.Get("job21")
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "Out of host capacity") || !strings.HasPrefix(j.Error, "provision node:") {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	list, _ := h.client.CoreV1().Pods(testNS).List(context.Background(), metav1.ListOptions{})
+	if len(list.Items) != 0 {
+		t.Fatalf("no pod may be created when no node could be provisioned, got %d", len(list.Items))
+	}
+	if len(fp.released) != 0 {
+		t.Fatalf("nothing to release, got %v", fp.released)
+	}
+}
+
+func TestSweepAlsoSweepsNodes(t *testing.T) {
+	h := newHarness(t, Config{})
+	fp := &fakeProvisioner{client: h.client}
+	h.sp.cfg.Provisioner = fp
+	if _, err := h.sp.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fp.sweeps != 1 {
+		t.Fatalf("node sweep not invoked (%d)", fp.sweeps)
+	}
 }

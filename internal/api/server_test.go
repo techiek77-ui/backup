@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/techiek77-ui/backup/internal/config"
 	"github.com/techiek77-ui/backup/internal/store"
 )
 
@@ -203,5 +206,38 @@ func TestShutdownFailsQueuedJobs(t *testing.T) {
 	}
 	if j, _ := st.Get(first["id"].(string)); j.Status != store.StatusSucceeded {
 		t.Fatalf("running job should have been handed the cancelled ctx and finished, got %+v", j)
+	}
+}
+
+func TestSubmitSizeClass(t *testing.T) {
+	classes := map[string]config.SizeClass{
+		"small": {CPU: resource.MustParse("1"), Memory: resource.MustParse("2Gi")},
+		"large": {CPU: resource.MustParse("8"), Memory: resource.MustParse("32Gi"), NodePoolID: "ocid1.nodepool.oc1..large"},
+	}
+	ts, s, _ := newTestServer(t, Options{MaxConcurrent: 1, Classes: classes, DefaultClass: "small"}, 0)
+
+	resp, body := post(t, ts, `{"image":"scanner","size":"large"}`)
+	if resp.StatusCode != http.StatusAccepted || body["spec"].(map[string]any)["size"] != "large" {
+		t.Fatalf("large: %d %v", resp.StatusCode, body)
+	}
+	resp, body = post(t, ts, `{"image":"scanner"}`)
+	if resp.StatusCode != http.StatusAccepted || body["spec"].(map[string]any)["size"] != "small" {
+		t.Fatalf("default size not applied: %d %v", resp.StatusCode, body)
+	}
+	resp, body = post(t, ts, `{"image":"scanner","size":"huge"}`)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(body["error"].(string), "valid sizes: large, small") {
+		t.Fatalf("unknown size: %d %v", resp.StatusCode, body)
+	}
+	if err := s.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, sizes := get(t, ts, "/sizes")
+	if resp.StatusCode != 200 || sizes["default"] != "small" {
+		t.Fatalf("/sizes: %d %v", resp.StatusCode, sizes)
+	}
+	large := sizes["classes"].(map[string]any)["large"].(map[string]any)
+	if large["cpu"] != "8" || large["memory"] != "32Gi" || large["nodePoolId"] != "ocid1.nodepool.oc1..large" {
+		t.Fatalf("large view = %v", large)
 	}
 }

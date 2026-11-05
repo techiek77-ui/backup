@@ -15,10 +15,11 @@ import (
 type Status string
 
 const (
-	StatusPending   Status = "Pending"   // accepted, pod not yet created (or queued)
-	StatusRunning   Status = "Running"   // pod created, waiting for completion
-	StatusSucceeded Status = "Succeeded" // pod exited 0
-	StatusFailed    Status = "Failed"    // pod exited non-zero, timed out, or errored
+	StatusPending      Status = "Pending"      // accepted, pod not yet created (or queued)
+	StatusProvisioning Status = "Provisioning" // a node is being brought up for the job
+	StatusRunning      Status = "Running"      // pod created, waiting for completion
+	StatusSucceeded    Status = "Succeeded"    // pod exited 0
+	StatusFailed       Status = "Failed"       // pod exited non-zero, timed out, or errored
 )
 
 // Terminal reports whether no further transitions are expected.
@@ -33,6 +34,9 @@ type WorkSpec struct {
 	Args    []string `json:"args,omitempty"`
 	// TimeoutSeconds bounds pod runtime; 0 means use the controller default.
 	TimeoutSeconds int64 `json:"timeoutSeconds,omitempty"`
+	// Size names a configured size class (resources, node selection, and in
+	// controller-managed node mode the node pool). Empty means the default.
+	Size string `json:"size,omitempty"`
 }
 
 // Job is a single work request and its observed outcome.
@@ -42,6 +46,10 @@ type Job struct {
 	Status   Status   `json:"status"`
 	PodName  string   `json:"podName,omitempty"`
 	NodeName string   `json:"nodeName,omitempty"`
+	// NodeID is the cloud identifier (OCI instance OCID) of a node the
+	// controller brought up for this job; empty when nodes come from
+	// elsewhere (Cluster Autoscaler, Karpenter, virtual nodes).
+	NodeID string `json:"nodeId,omitempty"`
 	// Message carries the latest scheduling / image-pull hint while the job
 	// is in flight, e.g. "Unschedulable: 0/3 nodes are available ...".
 	Message   string     `json:"message,omitempty"`

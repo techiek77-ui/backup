@@ -33,7 +33,33 @@ type Config struct {
 	KeepFailedPods   bool
 	DefaultImage     string
 	LogLevel         string
+
+	// NodeMode decides who brings nodes up for worker pods:
+	//   none  the pod just carries its scheduling constraints; Cluster
+	//         Autoscaler, Karpenter or a virtual node pool provides the node
+	//   oke   the controller grows the class's OKE node pool by one, pins the
+	//         pod to the new node and deletes the node when the pod is done
+	NodeMode         string
+	SizeClasses      map[string]SizeClass
+	DefaultSizeClass string
+	// OnePodPerNode adds a required pod anti-affinity so two worker pods never
+	// share a node, whichever mode provides the nodes.
+	OnePodPerNode bool
+	// ProvisionTimeout bounds how long a node may take to become Ready in oke mode.
+	ProvisionTimeout time.Duration
+	// OCIAuthMode: auto | workload-identity | instance-principal | config-file.
+	OCIAuthMode string
 }
+
+const (
+	NodeModeNone = "none"
+	NodeModeOKE  = "oke"
+
+	OCIAuthAuto              = "auto"
+	OCIAuthWorkloadIdentity  = "workload-identity"
+	OCIAuthInstancePrincipal = "instance-principal"
+	OCIAuthConfigFile        = "config-file"
+)
 
 // FromEnv builds a Config, applying defaults for anything unset.
 func FromEnv() (Config, error) {
@@ -47,6 +73,11 @@ func FromEnv() (Config, error) {
 		KeepFailedPods:   envBool("KEEP_FAILED_PODS", false),
 		DefaultImage:     envStr("WORKER_DEFAULT_IMAGE", "busybox:1.36"),
 		LogLevel:         envStr("LOG_LEVEL", "info"),
+		NodeMode:         strings.ToLower(envStr("NODE_MODE", NodeModeNone)),
+		DefaultSizeClass: envStr("DEFAULT_SIZE_CLASS", "default"),
+		OnePodPerNode:    envBool("ONE_POD_PER_NODE", true),
+		ProvisionTimeout: 15 * time.Minute,
+		OCIAuthMode:      strings.ToLower(envStr("OCI_AUTH_MODE", OCIAuthAuto)),
 		DefaultTimeout:   10 * time.Minute,
 		ScheduleTimeout:  2 * time.Minute,
 		ImagePullTimeout: 3 * time.Minute,
@@ -73,14 +104,39 @@ func FromEnv() (Config, error) {
 	if c.SweepInterval, err = envDuration("SWEEP_INTERVAL", c.SweepInterval); err != nil {
 		return c, err
 	}
+	if c.ProvisionTimeout, err = envDuration("NODE_PROVISION_TIMEOUT", c.ProvisionTimeout); err != nil {
+		return c, err
+	}
 	for name, d := range map[string]time.Duration{
 		"WORKER_DEFAULT_TIMEOUT": c.DefaultTimeout, "WORKER_SCHEDULE_TIMEOUT": c.ScheduleTimeout,
 		"WORKER_IMAGE_PULL_TIMEOUT": c.ImagePullTimeout, "API_RETRY_WINDOW": c.APIRetryWindow,
-		"SWEEP_INTERVAL": c.SweepInterval,
+		"SWEEP_INTERVAL": c.SweepInterval, "NODE_PROVISION_TIMEOUT": c.ProvisionTimeout,
 	} {
 		if d <= 0 {
 			return c, fmt.Errorf("%s must be > 0", name)
 		}
+	}
+	if c.SizeClasses, err = ParseSizeClasses(os.Getenv("SIZE_CLASSES")); err != nil {
+		return c, err
+	}
+	if _, ok := c.SizeClasses[c.DefaultSizeClass]; !ok {
+		return c, fmt.Errorf("DEFAULT_SIZE_CLASS %q is not one of the configured classes %v", c.DefaultSizeClass, ClassNames(c.SizeClasses))
+	}
+	switch c.NodeMode {
+	case NodeModeNone:
+	case NodeModeOKE:
+		for _, name := range ClassNames(c.SizeClasses) {
+			if c.SizeClasses[name].NodePoolID == "" {
+				return c, fmt.Errorf("NODE_MODE=oke requires nodePoolId on every size class; %q has none", name)
+			}
+		}
+	default:
+		return c, fmt.Errorf("NODE_MODE must be %q or %q, got %q", NodeModeNone, NodeModeOKE, c.NodeMode)
+	}
+	switch c.OCIAuthMode {
+	case OCIAuthAuto, OCIAuthWorkloadIdentity, OCIAuthInstancePrincipal, OCIAuthConfigFile:
+	default:
+		return c, fmt.Errorf("OCI_AUTH_MODE must be one of auto, workload-identity, instance-principal, config-file; got %q", c.OCIAuthMode)
 	}
 	if v := strings.TrimSpace(os.Getenv("WORKER_TOLERATIONS")); v != "" {
 		if err := json.Unmarshal([]byte(v), &c.Tolerations); err != nil {

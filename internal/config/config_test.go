@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -85,3 +86,89 @@ func TestFromEnvErrors(t *testing.T) {
 		t.Error("SWEEP_INTERVAL=0 should error")
 	}
 }
+
+func TestParseSizeClasses(t *testing.T) {
+	def, err := ParseSizeClasses("")
+	if err != nil || cpuOf(def["default"]) != "500m" || memOf(def["default"]) != "256Mi" {
+		t.Fatalf("default classes = %v err=%v", def, err)
+	}
+
+	classes, err := ParseSizeClasses(`{
+	  "small": {"cpu":"1","memory":"2Gi","nodeSelector":{"size":"small"},"nodePoolId":"ocid1.nodepool.oc1..small"},
+	  "large": {"cpu":"8","memory":"32Gi","tolerations":[{"key":"dedicated","operator":"Equal","value":"scan","effect":"NoSchedule"}]}
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ClassNames(classes); !reflect.DeepEqual(got, []string{"large", "small"}) {
+		t.Fatalf("names = %v", got)
+	}
+	if cpuOf(classes["small"]) != "1" || classes["small"].NodeSelector["size"] != "small" || classes["small"].NodePoolID != "ocid1.nodepool.oc1..small" {
+		t.Errorf("small = %+v", classes["small"])
+	}
+	if memOf(classes["large"]) != "32Gi" || len(classes["large"].Tolerations) != 1 || classes["large"].Tolerations[0].Key != "dedicated" {
+		t.Errorf("large = %+v", classes["large"])
+	}
+
+	for name, bad := range map[string]string{
+		"not json":      `{`,
+		"empty":         `{}`,
+		"bad cpu":       `{"a":{"cpu":"lots","memory":"1Gi"}}`,
+		"zero memory":   `{"a":{"cpu":"1","memory":"0"}}`,
+		"unknown field": `{"a":{"cpu":"1","memory":"1Gi","shape":"VM.Standard.E4.Flex"}}`,
+		"bad name":      `{"Big Scan!":{"cpu":"1","memory":"1Gi"}}`,
+		"bad selector":  `{"a":{"cpu":"1","memory":"1Gi","nodeSelector":{"bad key!":"x"}}}`,
+	} {
+		if _, err := ParseSizeClasses(bad); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}
+
+func TestFromEnvNodeModes(t *testing.T) {
+	t.Setenv("SIZE_CLASSES", `{"small":{"cpu":"1","memory":"2Gi","nodePoolId":"ocid1.nodepool.oc1..a"},"large":{"cpu":"4","memory":"8Gi"}}`)
+	t.Setenv("DEFAULT_SIZE_CLASS", "small")
+
+	c, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NodeMode != NodeModeNone || !c.OnePodPerNode || c.ProvisionTimeout != 15*time.Minute || c.OCIAuthMode != OCIAuthAuto {
+		t.Errorf("defaults: %+v", c)
+	}
+
+	t.Setenv("NODE_MODE", "oke")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), `"large" has none`) {
+		t.Fatalf("oke mode must require nodePoolId on every class, got %v", err)
+	}
+	t.Setenv("SIZE_CLASSES", `{"small":{"cpu":"1","memory":"2Gi","nodePoolId":"ocid1.nodepool.oc1..a"}}`)
+	t.Setenv("OCI_AUTH_MODE", "instance-principal")
+	t.Setenv("NODE_PROVISION_TIMEOUT", "20m")
+	t.Setenv("ONE_POD_PER_NODE", "false")
+	c, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NodeMode != NodeModeOKE || c.OCIAuthMode != OCIAuthInstancePrincipal || c.ProvisionTimeout != 20*time.Minute || c.OnePodPerNode {
+		t.Errorf("oke config: %+v", c)
+	}
+
+	t.Setenv("DEFAULT_SIZE_CLASS", "huge")
+	if _, err := FromEnv(); err == nil {
+		t.Error("unknown DEFAULT_SIZE_CLASS must error")
+	}
+	t.Setenv("DEFAULT_SIZE_CLASS", "small")
+	t.Setenv("NODE_MODE", "karpenter")
+	if _, err := FromEnv(); err == nil {
+		t.Error("unknown NODE_MODE must error")
+	}
+	t.Setenv("NODE_MODE", "none")
+	t.Setenv("OCI_AUTH_MODE", "password")
+	if _, err := FromEnv(); err == nil {
+		t.Error("unknown OCI_AUTH_MODE must error")
+	}
+}
+
+// Quantity's String has a pointer receiver; map values are not addressable.
+func cpuOf(c SizeClass) string { return c.CPU.String() }
+func memOf(c SizeClass) string { return c.Memory.String() }

@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podspawner
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ocirsecret
+      containers:
+        - name: controller
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_MODE
+              value: oke
+            # One node pool per size class. Each pool: size 0, the shape for
+            # that class, initial node label workload=worker, NOT managed by
+            # any autoscaler, and used by nothing but this controller (every
+            # node in it that no active scan owns is deleted).
+            - name: SIZE_CLASSES
+              value: '{"small":{"cpu":"1","memory":"2Gi","nodePoolId":"ocid1.nodepool.oc1.REGION.SMALL_POOL_OCID"},"large":{"cpu":"8","memory":"32Gi","nodePoolId":"ocid1.nodepool.oc1.REGION.LARGE_POOL_OCID"}}'
+            - name: DEFAULT_SIZE_CLASS
+              value: small
+            # Must match the pools' initial node labels (the pod is also pinned
+            # to its node by name; the selector is a second guard).
+            - name: WORKER_NODE_SELECTOR
+              value: "workload=worker"
+            # Scale-up + instance boot + kubelet join. Measure on your tenancy
+            # and leave headroom.
+            - name: NODE_PROVISION_TIMEOUT
+              value: 15m
+            # How the controller authenticates to OCI:
+            #   workload-identity  enhanced clusters; IAM policy on this
+            #                      ServiceAccount (README in this directory)
+            #   instance-principal basic clusters; dynamic group + policy
+            - name: OCI_AUTH_MODE
+              value: workload-identity
+            # Required for workload-identity, e.g. eu-frankfurt-1
+            - name: OCI_RESOURCE_PRINCIPAL_REGION
+              value: REGION_IDENTIFIER

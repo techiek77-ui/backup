@@ -30,11 +30,14 @@ kind-down:
 ## OKE: build for the node pool arch, push to OCIR, apply the overlay with
 ## the image substituted. Example:
 ##   make oke-push oke-deploy IMAGE=fra.ocir.io/axabcdefghij/podspawner:0.1.0
+##   make oke-deploy OVERLAY=oke-managed-nodes IMAGE=...   (controller-managed nodes)
 oke-push:
 	docker buildx build --platform $(PLATFORM) -t $(IMAGE) --push .
 
+OVERLAY ?= oke
+
 oke-deploy:
-	kubectl kustomize deploy/overlays/oke \
+	kubectl kustomize deploy/overlays/$(OVERLAY) \
 	  | sed 's#REGION_KEY.ocir.io/TENANCY_NAMESPACE/podspawner:0.1.0#$(IMAGE)#g' \
 	  | kubectl apply -f -
 	kubectl -n podspawner rollout status deploy/podspawner --timeout=180s

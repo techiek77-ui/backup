@@ -34,3 +34,27 @@ kind: ServiceAccount
 metadata:
   name: podspawner-worker
 automountServiceAccountToken: false
+---
+# Nodes are cluster-scoped, so the one cluster-wide grant: read-only, used in
+# NODE_MODE=oke to tell when a provisioned node has joined and is Ready.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podspawner-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podspawner-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podspawner-nodes
+subjects:
+  - kind: ServiceAccount
+    name: podspawner
+    namespace: podspawner

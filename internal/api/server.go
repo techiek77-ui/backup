@@ -3,6 +3,7 @@
 //	POST /work        submit work, returns 202 + {"id": ...}
 //	GET  /work        list jobs (newest first)
 //	GET  /work/{id}   job status, exit code and logs
+//	GET  /sizes       configured size classes
 //	GET  /healthz     liveness
 //	GET  /readyz      readiness
 package api
@@ -21,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/techiek77-ui/backup/internal/config"
 	"github.com/techiek77-ui/backup/internal/store"
 )
 
@@ -35,6 +37,10 @@ type Options struct {
 	MaxConcurrent int
 	DefaultImage  string
 	MaxBodyBytes  int64
+	// Classes are the accepted values of the request's "size" field;
+	// DefaultClass is applied when it is empty.
+	Classes      map[string]config.SizeClass
+	DefaultClass string
 }
 
 type Server struct {
@@ -57,6 +63,12 @@ func New(base context.Context, st *store.Store, runner Runner, opts Options, log
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = 64 * 1024
 	}
+	if len(opts.Classes) == 0 {
+		opts.Classes = config.DefaultSizeClasses()
+	}
+	if _, ok := opts.Classes[opts.DefaultClass]; !ok {
+		opts.DefaultClass = config.ClassNames(opts.Classes)[0]
+	}
 	if log == nil {
 		log = slog.Default()
 	}
@@ -78,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /work", s.handleSubmit)
 	mux.HandleFunc("GET /work", s.handleList)
 	mux.HandleFunc("GET /work/{id}", s.handleGet)
+	mux.HandleFunc("GET /sizes", s.handleSizes)
 	return logging(s.log, mux)
 }
 
@@ -97,9 +110,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "podspawner",
 		"endpoints": []string{
-			"POST /work  {\"image\":\"busybox:1.36\",\"command\":[\"sh\",\"-c\",\"echo hi\"]}",
+			"POST /work  {\"image\":\"busybox:1.36\",\"command\":[\"sh\",\"-c\",\"echo hi\"],\"size\":\"" + s.opts.DefaultClass + "\"}",
 			"GET  /work",
 			"GET  /work/{id}",
+			"GET  /sizes",
 		},
 	})
 }
@@ -131,6 +145,13 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if spec.TimeoutSeconds < 0 {
 		writeError(w, http.StatusBadRequest, "timeoutSeconds must be >= 0")
+		return
+	}
+	if spec.Size = strings.TrimSpace(spec.Size); spec.Size == "" {
+		spec.Size = s.opts.DefaultClass
+	}
+	if _, ok := s.opts.Classes[spec.Size]; !ok {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown size %q; valid sizes: %s", spec.Size, strings.Join(config.ClassNames(s.opts.Classes), ", ")))
 		return
 	}
 
@@ -171,6 +192,22 @@ func (s *Server) dispatch(id string) {
 		defer func() { <-s.sem }()
 		s.runner.Run(s.base, id)
 	}()
+}
+
+type sizeView struct {
+	CPU          string            `json:"cpu"`
+	Memory       string            `json:"memory"`
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	Tolerations  int               `json:"tolerations,omitempty"`
+	NodePoolID   string            `json:"nodePoolId,omitempty"`
+}
+
+func (s *Server) handleSizes(w http.ResponseWriter, _ *http.Request) {
+	out := map[string]sizeView{}
+	for name, c := range s.opts.Classes {
+		out[name] = sizeView{CPU: c.CPU.String(), Memory: c.Memory.String(), NodeSelector: c.NodeSelector, Tolerations: len(c.Tolerations), NodePoolID: c.NodePoolID}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"default": s.opts.DefaultClass, "classes": out})
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
