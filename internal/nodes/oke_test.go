@@ -516,3 +516,51 @@ func TestReleaseIsIdempotentWhileNodeIsDeleting(t *testing.T) {
 		t.Fatalf("deletes = %d, want 2", len(d))
 	}
 }
+
+func TestKubeNodeReadyChecks(t *testing.T) {
+	_, p := newHarness(t, OKEConfig{})
+	ctx := context.Background()
+	mk := func(name, providerID string, ready bool, unschedulable bool, taints ...corev1.Taint) {
+		t.Helper()
+		status := corev1.ConditionFalse
+		if ready {
+			status = corev1.ConditionTrue
+		}
+		_, err := p.kube.CoreV1().Nodes().Create(ctx, &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       corev1.NodeSpec{ProviderID: providerID, Unschedulable: unschedulable, Taints: taints},
+			Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: status}}},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("10.0.0.1", "oci://ocid1.instance.oc1.iad.ready", true, false)
+	mk("10.0.0.2", "ocid1.instance.oc1.iad.notready", false, false)
+	mk("10.0.0.3", "ocid1.instance.oc1.iad.cordoned", true, true)
+	mk("10.0.0.4", "ocid1.instance.oc1.iad.uninit", true, false, corev1.Taint{Key: "node.cloudprovider.kubernetes.io/uninitialized", Effect: corev1.TaintEffectNoSchedule})
+	mk("10.0.0.5", "", true, false) // joined without providerID yet: matched by private IP
+
+	okeNode := func(id, ip string) *containerengine.Node {
+		return &containerengine.Node{Id: common.String(id), PrivateIp: common.String(ip)}
+	}
+	cases := []struct {
+		name  string
+		node  *containerengine.Node
+		found string
+		ready bool
+	}{
+		{"ready with oci:// prefix", okeNode("ocid1.instance.oc1.iad.ready", "10.0.0.1"), "10.0.0.1", true},
+		{"not ready", okeNode("ocid1.instance.oc1.iad.notready", "10.0.0.2"), "10.0.0.2", false},
+		{"cordoned", okeNode("ocid1.instance.oc1.iad.cordoned", "10.0.0.3"), "10.0.0.3", false},
+		{"uninitialized taint", okeNode("ocid1.instance.oc1.iad.uninit", "10.0.0.4"), "10.0.0.4", false},
+		{"matched by private IP", okeNode("ocid1.instance.oc1.iad.noprovider", "10.0.0.5"), "10.0.0.5", true},
+		{"not joined", okeNode("ocid1.instance.oc1.iad.missing", "10.0.0.6"), "", false},
+	}
+	for _, c := range cases {
+		name, ready := p.kubeNodeReady(ctx, c.node)
+		if name != c.found || ready != c.ready {
+			t.Errorf("%s: got (%q,%v) want (%q,%v)", c.name, name, ready, c.found, c.ready)
+		}
+	}
+}

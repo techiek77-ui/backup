@@ -255,6 +255,9 @@ func (p *OKE) awaitClaim(ctx context.Context, poolID string, w *waiter, report R
 		np, err := p.getPool(ctx, poolID)
 		if err != nil {
 			p.dropWaiter(poolID, w)
+			if n := p.drain(w); n != nil { // assigned in the meantime: don't leave it behind
+				_ = p.Release(context.Background(), n)
+			}
 			return nil, err
 		}
 		p.mu.Lock()

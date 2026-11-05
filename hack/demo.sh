@@ -43,7 +43,7 @@ while :; do
   JOB=$(curl -sf "$BASE/work/$ID")
   STATUS=$(jq -r .status <<<"$JOB")
   MSG=$(jq -r '.message // empty' <<<"$JOB")
-  printf '   status=%s %s\n' "$STATUS" "${MSG:+($MSG)}"
+  printf '   %s status=%s %s\n' "$(date +%H:%M:%S)" "$STATUS" "${MSG:+($MSG)}"
   if [ "$STATUS" = Running ] && [ "$SHOWN" = 0 ]; then
     SHOWN=1
     sleep 2

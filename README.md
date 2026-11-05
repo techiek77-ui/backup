@@ -87,7 +87,8 @@ cluster runs:
   egress in the namespace, allow the controller to reach the API server.
 * At least one node carrying the worker label (`workload=worker` by default)
   that can run pods: Ready, not cordoned, tolerating any taint on it (see
-  `WORKER_TOLERATIONS`), with room for the requests (50m CPU, 64Mi).
+  `WORKER_TOLERATIONS`), with room for the size class's `cpu`/`memory`
+  (500m / 256Mi for the default class).
 * Nodes able to pull the worker images (Docker Hub through a NAT gateway, or
   a mirror in OCIR with `WORKER_IMAGE_PULL_SECRET`) and the controller image
   (OCIR with `ocirsecret`).
@@ -99,8 +100,9 @@ cluster runs:
   already hold, so this is a namespace admin or `cluster-admin`; on OKE a
   tenancy Administrator or a user bound to `cluster-admin` (step 0 below).
 * The controller itself needs only what `deploy/base/rbac.yaml` grants:
-  `pods` create/get/list/watch/delete and `pods/log` get, in its own
-  namespace. No cluster-wide permissions and no access to secrets or nodes.
+  `pods` create/get/list/watch/delete and `pods/log` get in its own
+  namespace, plus read-only `nodes` cluster-wide (to see when a provisioned
+  node is Ready). No access to secrets.
 
 **For controller-managed nodes (`NODE_MODE=oke`)**
 
@@ -397,8 +399,9 @@ sequenceDiagram
    finished (pods kept by `KEEP_FAILED_PODS` are left alone). Start-up
    therefore clears everything a previous instance left behind, and later
    sweeps catch the rare pod whose delete failed during an API-server outage.
-7. **Boundaries.** RBAC is namespace-scoped: `create/get/list/watch/delete`
-   on pods and `get` on `pods/log`, nothing else. The Deployment runs one
+7. **Boundaries.** Pod RBAC is namespace-scoped: `create/get/list/watch/delete`
+   on pods and `get` on `pods/log`; the only cluster-wide grant is read-only
+   `nodes`. The Deployment runs one
    replica with `strategy: Recreate` so two controllers never overlap (the
    new one's start-up sweep would otherwise delete the old one's pods).
 
@@ -644,7 +647,8 @@ controller log (`kubectl -n podspawner logs deploy/podspawner`), and
   Autoscaler or KEDA, not a pod per request.
 * **One namespace.** The controller creates, watches, sweeps and deletes worker
   pods in its own namespace only (`POD_NAMESPACE`, injected from the pod's
-  metadata), and its RBAC is a namespaced `Role`. Everything the workers rely
+  metadata), and its pod RBAC is a namespaced `Role` (the only cluster-wide
+  grant is read-only `nodes`). Everything the workers rely
   on, the `podspawner-worker` ServiceAccount, pull secrets, quotas and
   policies, lives in that namespace. To run workers in other namespaces you
   need, per target namespace: a `RoleBinding` granting the controller's
